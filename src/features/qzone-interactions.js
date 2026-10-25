@@ -719,10 +719,15 @@ export class QzoneInteractionManager {
       }
     }
     let baselineUins = new Set();
-    if (primaryError || !data.feeds.length) {
+    const homeFeeds = data?.feeds || [];
+    const selfId = String(this.onebot.selfId || '');
+    const onlySelf = Boolean(selfId) && homeFeeds.length > 0
+      && homeFeeds.every((feed) => String(feed?.uin || '') === selfId);
+    if (primaryError || !homeFeeds.length || onlySelf) {
       if (run) {
         run.feedSource = 'friend-spaces';
-        run.feedPrimaryError = primaryError ? cleanText(primaryError?.message ?? primaryError, 500) : '首页动态列表为空';
+        run.feedPrimaryError = primaryError ? cleanText(primaryError?.message ?? primaryError, 500)
+          : (onlySelf ? '首页只有自己的动态' : '首页动态列表为空');
       }
       try {
         const fallback = await fetchQzoneFriendSpaces(this.onebot, {
@@ -740,7 +745,7 @@ export class QzoneInteractionManager {
         }
         for (const uin of fallback.successfulUins) seen.add(uin);
         this.state.friendFeedSeenUins = [...seen].slice(-10000);
-        data = fallback;
+        data = { ...fallback, feeds: [...homeFeeds, ...fallback.feeds] };
         console.log(`[qzone-interactions] 个人空间兜底: 查询=${fallback.stats.attempted} 成功=${fallback.stats.succeeded} 失败=${fallback.stats.failed} 总好友=${fallback.stats.totalFriends}`);
       } catch (error) {
         signal?.throwIfAborted();
