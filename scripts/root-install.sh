@@ -118,21 +118,23 @@ SERVICE_USER="${QQ_AGENT_SERVICE_USER:-}"
 SERVICE_USER_EXPLICIT=false
 [[ -n "$SERVICE_USER" ]] && SERVICE_USER_EXPLICIT=true
 
-if [[ "$SERVICE_USER_EXPLICIT" != true && -f "$ROOT_DIR/app/.deployment.json" ]]; then
-  OWNER="$(stat -c '%U' "$ROOT_DIR/app" 2>/dev/null || true)"
-  if [[ "$OWNER" == "root" ]]; then
-    die "检测到既有安装属于 root：$ROOT_DIR/app。请先按 docs/LINUX.md 迁移到一个普通用户，或手工指定 QQ_AGENT_SERVICE_USER。"
+if [[ "$TEST_MODE" != "1" ]]; then
+  if [[ "$SERVICE_USER_EXPLICIT" != true && -f "$ROOT_DIR/app/.deployment.json" ]]; then
+    OWNER="$(stat -c '%U' "$ROOT_DIR/app" 2>/dev/null || true)"
+    if [[ "$OWNER" == "root" ]]; then
+      die "检测到既有安装属于 root：$ROOT_DIR/app。请先按 docs/LINUX.md 迁移到一个普通用户，或手工指定 QQ_AGENT_SERVICE_USER。"
+    fi
+    [[ -n "$OWNER" ]] && SERVICE_USER="$OWNER"
   fi
-  [[ -n "$OWNER" ]] && SERVICE_USER="$OWNER"
-fi
 
-if [[ -z "$SERVICE_USER" && -d "$ROOT_DIR" ]]; then
-  OWNER="$(stat -c '%U' "$ROOT_DIR" 2>/dev/null || true)"
-  [[ -n "$OWNER" && "$OWNER" != "root" ]] && SERVICE_USER="$OWNER"
-fi
+  if [[ -z "$SERVICE_USER" && -d "$ROOT_DIR" ]]; then
+    OWNER="$(stat -c '%U' "$ROOT_DIR" 2>/dev/null || true)"
+    [[ -n "$OWNER" && "$OWNER" != "root" ]] && SERVICE_USER="$OWNER"
+  fi
 
-if [[ -z "$SERVICE_USER" && -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
-  SERVICE_USER="$SUDO_USER"
+  if [[ -z "$SERVICE_USER" && -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    SERVICE_USER="$SUDO_USER"
+  fi
 fi
 
 SERVICE_USER="${SERVICE_USER:-qqagent}"
