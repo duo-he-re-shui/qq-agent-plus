@@ -27,6 +27,7 @@ import {
 import { resolveToolCalls } from '../tools/inline-tools.js';
 import { minuteOfDayInZone, sanitizeUserText } from '../core/util.js';
 import { newTraceId, withTrace } from '../core/logger.js';
+import { fetchQzoneFriendSpaces } from '../onebot/qzone-friend-spaces.js';
 
 const STATE_FILE = path.join(DATA_DIR, 'qzone-interactions.json');
 const HOUR_MS = 60 * 60 * 1000;
@@ -41,6 +42,21 @@ function cleanText(value, max = 1000) {
   // 双保险：数据源头（qzone-feed.js 的 compact）已过 sanitizeUserText，
   // 拼进互动决策提示词前再过一次 —— 昵称等字段可能绕过 compact 直达这里。
   return sanitizeUserText(String(value ?? '').replace(/\0/g, '').replace(/[ \t]+/g, ' ').trim()).slice(0, max);
+}
+
+function feedTransportCodes(error) {
+  const codes = new Set();
+  const pending = [error];
+  // Undici puts ECONNRESET/UND_ERR_SOCKET on cause, sometimes inside an
+  // AggregateError. Keep only codes, never URLs, tokens or raw response bodies.
+  for (let i = 0; i < pending.length && i < 16; i++) {
+    const item = pending[i];
+    if (!item || typeof item !== 'object') continue;
+    if (/^[A-Z][A-Z0-9_]{1,63}$/.test(String(item.code || ''))) codes.add(item.code);
+    if (item.cause) pending.push(item.cause);
+    if (Array.isArray(item.errors)) pending.push(...item.errors.slice(0, 8));
+  }
+  return [...codes];
 }
 
 function readJson(file, fallback) {
@@ -139,6 +155,8 @@ function defaultState() {
     replyInitializedAt: 0,
     lastFeedPollAt: 0,
     lastReplyPollAt: 0,
+    friendFeedCursor: '',
+    friendFeedSeenUins: [],
     feeds: [],
     comments: [],
     watchedPosts: [],
@@ -160,6 +178,8 @@ function normalizeState(raw) {
   state.replyInitializedAt = Number(state.replyInitializedAt) || 0;
   state.lastFeedPollAt = Number(state.lastFeedPollAt) || 0;
   state.lastReplyPollAt = Number(state.lastReplyPollAt) || 0;
+  state.friendFeedCursor = String(state.friendFeedCursor || '');
+  state.friendFeedSeenUins = Array.isArray(state.friendFeedSeenUins) ? state.friendFeedSeenUins.map(String) : [];
   return state;
 }
 
@@ -636,12 +656,31 @@ export class QzoneInteractionManager {
 
   /** 取一页好友动态；接口失败与返回结构异常都算失败，由 #discoverFeeds 决定是否重试。 */
   async #fetchFeeds(cfg, signal) {
-    const data = await this.onebot.call(
-      'get_qzone_feeds',
-      { page_num: 1, count: cfg.feedFetchCount },
-      30000,
-      signal
-    );
+    const params = { page_num: 1, count: cfg.feedFetchCount };
+    let data;
+    try {
+      data = await this.onebot.call('get_qzone_feeds', params, 30000, signal);
+    } catch (error) {
+      signal?.throwIfAborted();
+      const codes = feedTransportCodes(error);
+      const transportFailure = error?.message === 'fetch failed'
+        || error?.name === 'TimeoutError'
+        || codes.some((code) => /^(ECONNRESET|ECONNREFUSED|EPIPE|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|UND_ERR_)/.test(code));
+      if (!transportFailure || error?.outcome === 'failed') throw error;
+      const detail = `OneBot get_qzone_feeds HTTP 连接失败${codes.length ? ` (${codes.join(', ')})` : ''}`;
+      if (!this.onebot.connected || typeof this.onebot.callViaWs !== 'function') {
+        throw new Error(`${detail}；WebSocket 不可用，请检查 OneBot HTTP 地址和协议端网络`, { cause: error });
+      }
+      // This is a read-only API. Reuse the authenticated event connection when
+      // the HTTP connection is dropped; never apply this retry to Qzone writes.
+      console.log(`[qzone-interactions] ${detail}，改用 WebSocket 读取`);
+      try {
+        data = await this.onebot.callViaWs('get_qzone_feeds', params, 30000, signal);
+      } catch (wsError) {
+        signal?.throwIfAborted();
+        throw new Error(`${detail}；WebSocket 读取失败: ${cleanText(wsError?.message ?? wsError, 200)}`, { cause: wsError });
+      }
+    }
     if (!Array.isArray(data?.feeds)) throw new Error('好友动态接口返回格式无效');
     return data;
   }
@@ -659,8 +698,9 @@ export class QzoneInteractionManager {
     ]);
   }
 
-  async #discoverFeeds(cfg, signal) {
+  async #discoverFeeds(cfg, signal, run, includeExisting) {
     let data;
+    let primaryError;
     try {
       data = await this.#fetchFeeds(cfg, signal);
     } catch (error) {
@@ -671,27 +711,87 @@ export class QzoneInteractionManager {
       );
       await this.#waitBeforeFeedRetry(signal);
       signal?.throwIfAborted();
-      data = await this.#fetchFeeds(cfg, signal);
+      try {
+        data = await this.#fetchFeeds(cfg, signal);
+      } catch (retryError) {
+        signal?.throwIfAborted();
+        primaryError = retryError;
+      }
     }
+    let baselineUins = new Set();
+    if (primaryError || !data.feeds.length) {
+      if (run) {
+        run.feedSource = 'friend-spaces';
+        run.feedPrimaryError = primaryError ? cleanText(primaryError?.message ?? primaryError, 500) : '首页动态列表为空';
+      }
+      try {
+        const fallback = await fetchQzoneFriendSpaces(this.onebot, {
+          signal, count: cfg.feedFetchCount, cursor: this.state.friendFeedCursor, sleep: this.sleep
+        });
+        this.state.friendFeedCursor = fallback.cursor;
+        if (run) run.friendSpaceFetchStats = fallback.stats;
+        if (fallback.stats.attempted && !fallback.stats.succeeded) {
+          throw new Error(`个人空间兜底全部失败: ${cleanText(fallback.lastError?.message || '请求失败', 200)}`);
+        }
+        if (primaryError && !fallback.stats.succeeded) throw primaryError;
+        const seen = new Set(this.state.friendFeedSeenUins);
+        if (run?.source === 'scheduled' && !includeExisting) {
+          baselineUins = new Set(fallback.successfulUins.filter((uin) => !seen.has(uin)));
+        }
+        for (const uin of fallback.successfulUins) seen.add(uin);
+        this.state.friendFeedSeenUins = [...seen].slice(-10000);
+        data = fallback;
+        console.log(`[qzone-interactions] 个人空间兜底: 查询=${fallback.stats.attempted} 成功=${fallback.stats.succeeded} 失败=${fallback.stats.failed} 总好友=${fallback.stats.totalFriends}`);
+      } catch (error) {
+        signal?.throwIfAborted();
+        throw new Error(primaryError
+          ? `${cleanText(primaryError?.message ?? primaryError, 300) || '好友动态接口调用失败（无错误信息）'}；${cleanText(error?.message ?? error, 200)}`
+          : cleanText(error?.message ?? error, 500), { cause: error });
+      }
+    } else if (run) run.feedSource = 'home';
     const cutoff = Math.floor((this.now() - cfg.maxAgeHours * HOUR_MS) / 1000);
     let discovered = 0;
+    const stats = { fetched: data.feeds.length, unsupported: 0, invalid: 0, expired: 0, self: 0, existing: 0, emptyContent: 0 };
+    if (run) run.feedFetchStats = stats;
     for (const raw of data.feeds) {
       const post = parseQzoneFeed(raw);
-      if (post.appid !== 311 || !post.tid || !post.uin || post.time < cutoff) continue;
+      if (post.appid !== 311) { stats.unsupported += 1; continue; }
+      if (!post.tid || !post.uin || !Number.isFinite(post.time) || post.time <= 0) { stats.invalid += 1; continue; }
+      if (post.time < cutoff) { stats.expired += 1; continue; }
+      if (!post.content && !post.images.length) stats.emptyContent += 1;
+      // Older versions used the list key as the post tid. Keep reviewed/unknown
+      // states when HTML metadata (or a newer server) supplies the real tid.
+      const key = qzonePostKey(post);
+      const legacyKey = `${post.uin}:${raw.key || ''}`;
+      if (raw.key && legacyKey !== key) {
+        for (const item of this.state.feeds.filter((item) => item.key === legacyKey)) {
+          item.key = key;
+          item.post = post;
+        }
+        for (const watch of this.state.watchedPosts.filter((item) => item.key === legacyKey)) {
+          watch.key = key;
+          watch.tid = post.tid;
+        }
+        for (const item of this.state.comments.filter((item) => qzonePostKey(item.post) === legacyKey)) {
+          item.post.tid = post.tid;
+          item.key = qzoneCommentKey(item.post, item.comment);
+        }
+      }
       if (post.uin === String(this.onebot.selfId || '')) {
+        stats.self += 1;
         this.#watchPost(post);
         this.#queueComments(post);
         continue;
       }
-      const key = qzonePostKey(post);
       const existing = this.state.feeds.find((item) => item.key === key);
       if (existing) {
+        stats.existing += 1;
         existing.post = post;
         existing.updatedAt = this.now();
       } else {
         this.state.feeds.push({
           key,
-          status: 'unread',
+          status: baselineUins.has(post.uin) ? 'baseline' : 'unread',
           discoveredAt: this.now(),
           updatedAt: this.now(),
           post
@@ -700,6 +800,7 @@ export class QzoneInteractionManager {
       }
       if (this.state.watchedPosts.some((item) => item.key === key)) this.#queueComments(post);
     }
+    console.log(`[qzone-interactions] 好友动态读取: 返回=${stats.fetched} 新增=${discovered} 已有=${stats.existing} 自己=${stats.self} 过期=${stats.expired} 非说说=${stats.unsupported} 字段无效=${stats.invalid} 正文及图片为空=${stats.emptyContent}`);
     this.state.lastFeedPollAt = this.now();
     return discovered;
   }
@@ -1274,7 +1375,7 @@ export class QzoneInteractionManager {
       let feedOk = false;
       if (kind === 'all' || kind === 'feed') {
         try {
-          run.discoveredFeeds = await this.#discoverFeeds(cfg, this.controller.signal);
+          run.discoveredFeeds = await this.#discoverFeeds(cfg, this.controller.signal, run, includeExisting);
           feedOk = true;
         } catch (error) {
           // 中止（手动停止/重启/离开活跃时段）照旧结束整轮，不算接口失败

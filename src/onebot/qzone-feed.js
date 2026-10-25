@@ -142,6 +142,29 @@ function parsedCommentContent(item) {
   return compact(fragment.textContent.replace(/^[\s:：]+/, ''), 800);
 }
 
+function feedContentText(node) {
+  if (!node) return '';
+  const fragment = parse(node.innerHTML);
+  for (const toggle of fragment.querySelectorAll('[data-cmd="qz_toggle"], .load_img')) toggle.remove();
+  for (const br of fragment.querySelectorAll('br')) br.replaceWith(' ');
+  // Emoji text must remain text, even if an alt attribute contains HTML.
+  for (const img of fragment.querySelectorAll('img')) {
+    const alt = String(img.getAttribute('alt') || '')
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    img.replaceWith(alt);
+  }
+  return compact(fragment.textContent, 1200);
+}
+
+function feedImageUrl(value) {
+  if (typeof value !== 'string' || !value) return '';
+  try {
+    const url = new URL(value.startsWith('//') ? `https:${value}` : value);
+    if (!['http:', 'https:'].includes(url.protocol) || /(^|\.)qzonestyle\.gtimg\.cn$/i.test(url.hostname)) return '';
+    return url.href;
+  } catch { return ''; }
+}
+
 export function parseQzoneFeed(feed) {
   const html = String(feed?.html || '');
   const root = parse(html);
@@ -169,21 +192,43 @@ export function parseQzoneFeed(feed) {
       time: 0
     };
   }).filter((comment) => comment.commentId && comment.uin);
-  const images = root.querySelectorAll('.img-box img')
-    .map((image) => String(image.getAttribute('src') || '').replace(/&amp;/g, '&'))
-    .filter((url) => /^https?:\/\//i.test(url) && !/qzonestyle\.gtimg\.cn/i.test(url));
+  // The first .f-info can be an empty hidden full-text placeholder. Exclude
+  // comments/reposts, prefer a populated full version, then the visible excerpt.
+  const body = root.querySelectorAll('.f-item').find((node) => node.getAttribute('data-key') === String(feed?.key || '')) || root;
+  const isOwnContent = (node) => {
+    for (let parent = node.parentNode; parent && parent !== body; parent = parent.parentNode) {
+      if (['mod-comments', 'comments-list', 'f-item-passive', 'f-ct-video'].some((name) => parent.classList?.contains(name))) return false;
+    }
+    return true;
+  };
+  const contentNodes = body.querySelectorAll('.f-info').filter(isOwnContent);
+  const full = contentNodes.find((node) => node.classList.contains('qz_info_complete') && feedContentText(node));
+  const excerpt = contentNodes.find((node) => !node.classList.contains('qz_info_complete'));
+  const metadata = body.querySelectorAll('[name="feed_data"]').find((node) => (
+    isOwnContent(node)
+    && node.getAttribute('data-uin') === String(feed?.uin || '')
+    && node.getAttribute('data-fkey') === String(feed?.key || '')
+  ));
+  const htmlImages = body.querySelectorAll('.img-item, .img-box img').filter(isOwnContent).flatMap((node) => {
+    if (node.hasAttribute('data-v_itemid') || node.hasAttribute('data-videotype')) return [];
+    const original = feedImageUrl(node.getAttribute('data-originurl') || node.getAttribute('data-url3'));
+    if (original) return [original];
+    const items = node.tagName === 'IMG' ? [node] : node.querySelectorAll('img');
+    return items.map((img) => img.getAttribute('truesrc') || img.getAttribute('src'));
+  });
+  const images = (Array.isArray(feed?.images) ? feed.images : htmlImages).map(feedImageUrl).filter(Boolean);
   const like = root.querySelector('.qz_like_btn_v3');
   return {
-    tid: String(feed?.key || ''),
+    tid: String(feed?.tid || metadata?.getAttribute('data-tid') || feed?.key || ''),
     uin: String(feed?.uin || ''),
     nickname: compact(feed?.nickname || '', 80),
     time: Number(feed?.time) || 0,
     appid: Number(feed?.appid) || 0,
-    content: compact(root.querySelector('.f-info')?.textContent || '', 1200),
+    content: typeof feed?.content === 'string' ? compact(feed.content, 1200) : feedContentText(full || excerpt),
     images: [...new Set(images)].slice(0, 9),
     comments,
     isLiked: String(like?.getAttribute('data-islike') || '') === '1',
-    likeCount: Number(like?.getAttribute('data-likecnt')) || 0
+    likeCount: Number(feed?.like_count ?? like?.getAttribute('data-likecnt')) || 0
   };
 }
 
