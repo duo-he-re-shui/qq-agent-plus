@@ -142,6 +142,18 @@ function parsedCommentContent(item) {
   return compact(fragment.textContent.replace(/^[\s:：]+/, ''), 800);
 }
 
+function parsedFeedContent(root) {
+  // Qzone's current feed HTML moved the post body from `.f-info` to
+  // `.f-ct .txt-box-title`, which includes the author's nickname and colon.
+  const content = root.querySelector('.f-info')
+    || root.querySelector('.f-ct .txt-box-title')
+    || root.querySelector('.f-ct p');
+  if (!content) return '';
+  const fragment = parse(content.innerHTML);
+  for (const node of fragment.querySelectorAll('.nickname, .state')) node.remove();
+  return compact(fragment.textContent.replace(/^[\s:：]+/, ''), 1200);
+}
+
 export function parseQzoneFeed(feed) {
   const html = String(feed?.html || '');
   const root = parse(html);
@@ -179,7 +191,7 @@ export function parseQzoneFeed(feed) {
     nickname: compact(feed?.nickname || '', 80),
     time: Number(feed?.time) || 0,
     appid: Number(feed?.appid) || 0,
-    content: compact(root.querySelector('.f-info')?.textContent || '', 1200),
+    content: parsedFeedContent(root),
     images: [...new Set(images)].slice(0, 9),
     comments,
     isLiked: String(like?.getAttribute('data-islike') || '') === '1',

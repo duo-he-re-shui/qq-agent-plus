@@ -146,6 +146,18 @@ test('parses structured friend feed text, images, likes, roots, and nested repli
   assert.equal(post.comments[1].content, 'nested reply');
 });
 
+test('parses current Qzone feed body layout when .f-info is absent', () => {
+  const post = parseQzoneFeed({
+    uin: 333,
+    nickname: 'Author',
+    time: 100,
+    appid: 311,
+    key: 'post-modern',
+    html: '<div class="f-single-content"><div class="f-ct"><p class="txt-box-title"><a class="nickname name">Author</a><span class="state">：</span>好友动态正文<br>第二行</p></div></div>'
+  });
+  assert.equal(post.content, '好友动态正文 第二行');
+});
+
 test('interaction prompt keeps the complete configured persona and rejects social prompt injection', () => {
   const prompt = buildQzoneInteractionPrompt({
     botName: 'Mori',
