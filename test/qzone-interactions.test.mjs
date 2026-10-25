@@ -17,6 +17,7 @@ const {
 } = await import('../src/onebot/qzone-feed.js');
 const { QzoneInteractionManager, isNonFailureRunError } = await import('../src/features/qzone-interactions.js');
 const { buildQzoneInteractionPrompt } = await import('../src/llm/qzone-interaction-prompt.js');
+const { fetchQzoneFriendSpaces } = await import('../src/onebot/qzone-friend-spaces.js');
 
 after(() => fs.rmSync(root, { recursive: true, force: true }));
 
@@ -88,6 +89,8 @@ function fixture(patch = {}) {
     selfNickname: 'Bot',
     call: async (action, params) => {
       if (action === 'get_qzone_feeds') return feedCall(params);
+      if (action === 'get_friend_list') return patch.friends || [];
+      if (action === 'get_qzone_msg_list' && patch.friendSpaceCall && String(params.target_uin) !== '888') return patch.friendSpaceCall(params);
       if (action === 'get_qzone_msg_list') return { msglist: own };
       writes.push({ action, params });
       if (action === 'comment_qzone') return { comment_id: 'own-comment' };
@@ -144,6 +147,266 @@ test('parses structured friend feed text, images, likes, roots, and nested repli
   assert.equal(post.comments[0].parentTid, '');
   assert.equal(post.comments[1].parentTid, '1');
   assert.equal(post.comments[1].content, 'nested reply');
+});
+
+test('reads legacy feed metadata, complete text, lazy images and decoded entities', () => {
+  const post = parseQzoneFeed({
+    uin: 111, key: 'list-key', appid: 311, time: nowSec,
+    html: `<div class="f-item" data-key="list-key">
+      <div class="f-info qz_info_cut">摘要<a data-cmd="qz_toggle">展开全文</a></div>
+      <div class="f-info qz_info_complete none">完整 &amp; 正文<br>第二行<img alt="[笑]" src="https://qzonestyle.gtimg.cn/face.gif"></div>
+      <i name="feed_data" data-uin="111" data-fkey="list-key" data-tid="real-tid"></i>
+      <a class="img-item" data-originurl="//example.com/full.jpg?a=1&amp;b=2"><img src="https://example.com/thumb.jpg"></a>
+      <div class="img-box"><img truesrc="//example.com/lazy.jpg" src="https://qzonestyle.gtimg.cn/loading.gif"></div>
+    </div>`
+  });
+  assert.equal(post.tid, 'real-tid');
+  assert.equal(post.content, '完整 & 正文 第二行[笑]');
+  assert.deepEqual(post.images, ['https://example.com/full.jpg?a=1&b=2', 'https://example.com/lazy.jpg']);
+});
+
+test('empty complete placeholders do not hide excerpts or select comment text', () => {
+  assert.equal(parseQzoneFeed({ html: `
+    <div class="f-info qz_info_complete none"></div>
+    <div class="f-info qz_info_cut">可读正文</div>` }).content, '可读正文');
+  const post = parseQzoneFeed({ html: `
+    <div class="mod-comments"><div class="f-info">别人的评论</div></div>
+    <div class="f-info qz_info_complete none"></div>
+    <div class="f-info qz_info_cut">可读正文<a data-cmd="qz_toggle">展开全文</a></div>` });
+  assert.equal(post.content, '可读正文');
+});
+
+test('structured feed fields take precedence and keep intentionally empty content', () => {
+  const feed = {
+    key: 'list-key', tid: 'real-tid', content: '结构化正文',
+    images: ['//example.com/image.jpg', 'javascript:alert(1)', '//example.com/image.jpg'],
+    like_count: 0, html: htmlPost('旧摘要')
+  };
+  const post = parseQzoneFeed(feed);
+  assert.equal(post.tid, 'real-tid');
+  assert.equal(post.content, '结构化正文');
+  assert.deepEqual(post.images, ['https://example.com/image.jpg']);
+  assert.equal(post.likeCount, 0);
+  assert.equal(parseQzoneFeed({ ...feed, content: '', images: [] }).content, '');
+  assert.deepEqual(parseQzoneFeed({ ...feed, images: [] }).images, []);
+  assert.equal(parseQzoneFeed({ ...feed, content: null }).content, '旧摘要');
+});
+
+test('legacy HTML content reaches the model and feed diagnostics distinguish filtering from an empty response', async () => {
+  const valid = { uin: 111, key: 'post', appid: 311, time: nowSec,
+    html: '<div class="f-info qz_info_complete none"></div><div class="f-info">好友正文</div>' };
+  let calls = 0;
+  const f = fixture({
+    feed: [valid, { ...valid, key: 'old', time: 1 }, { ...valid, key: 'album', appid: 4 },
+      { ...valid, key: 'invalid', time: 0 }, { ...valid, key: 'self', uin: 888 }],
+    complete: async ({ messages }) => {
+      calls += 1;
+      assert.match(messages.at(-1).content, /好友正文/);
+      return response({ feedActions: idsFromMessages(messages, 'feed').map((id) => ({ id, action: 'skip' })), replyActions: [] });
+    }
+  });
+  const first = await f.manager.runNow('feed');
+  assert.equal(first.run.selectedFeeds, 1);
+  assert.deepEqual(first.run.feedFetchStats, {
+    fetched: 5, unsupported: 1, invalid: 1, expired: 1, self: 1, existing: 0, emptyContent: 0
+  });
+  const second = await f.manager.runNow('feed');
+  assert.equal(second.run.discoveredFeeds, 0);
+  assert.equal(second.run.feedFetchStats.existing, 1);
+  assert.equal(calls, 1);
+  assert.equal(JSON.parse(fs.readFileSync(f.stateFile)).runs[0].feedFetchStats.fetched, 5);
+  const empty = await fixture().manager.runNow('feed');
+  assert.equal(empty.run.feedFetchStats.fetched, 0);
+  assert.equal(empty.run.status, 'idle');
+});
+
+test('friend feed fetch failed falls back to the connected WebSocket without repeating writes', async () => {
+  const failure = new TypeError('fetch failed', { cause: Object.assign(new Error('socket closed'), { code: 'UND_ERR_SOCKET' }) });
+  const f = fixture({
+    feedCall: async () => { throw failure; },
+    complete: async ({ messages }) => response({
+      feedActions: idsFromMessages(messages, 'feed').map((id) => ({ id, action: 'skip' })), replyActions: []
+    })
+  });
+  f.onebot.connected = true;
+  let reads = 0;
+  f.onebot.callViaWs = async (action, params, timeout, signal) => {
+    reads += 1;
+    assert.equal(action, 'get_qzone_feeds');
+    assert.equal(params.page_num, 1);
+    assert.equal(timeout, 30000);
+    assert.equal(signal.aborted, false);
+    return { feeds: [{ uin: 111, key: 'post', appid: 311, time: nowSec, html: htmlPost('正文') }] };
+  };
+  const result = await f.manager.runNow('feed');
+  assert.equal(result.run.selectedFeeds, 1);
+  assert.equal(result.run.feedError, undefined);
+  assert.equal(reads, 1);
+  assert.deepEqual(f.sleeps, []);
+  assert.deepEqual(f.writes, []);
+});
+
+test('feed transport failure without WebSocket records nested error codes instead of bare fetch failed', async () => {
+  const failure = new TypeError('fetch failed', { cause: new AggregateError([
+    Object.assign(new Error('private URL must not be logged'), { code: 'ECONNRESET' })
+  ]) });
+  const f = fixture({ feedCall: async () => { throw failure; } });
+  const result = await f.manager.runNow('feed');
+  assert.match(result.run.feedError, /HTTP 连接失败.*ECONNRESET.*WebSocket 不可用/);
+  assert.doesNotMatch(result.run.feedError, /private URL/);
+  assert.deepEqual(f.sleeps, [45000]);
+});
+
+test('Qzone API rejection never falls back to another transport', async () => {
+  const f = fixture({ feedCall: async () => { throw new Error('OneBot get_qzone_feeds 失败: retcode=100 network busy'); } });
+  f.onebot.connected = true;
+  let wsReads = 0;
+  f.onebot.callViaWs = async () => { wsReads += 1; return { feeds: [] }; };
+  const result = await f.manager.runNow('feed');
+  assert.equal(wsReads, 0);
+  assert.match(result.run.feedError, /retcode=100/);
+});
+
+test('stopping an HTTP feed request does not start a WebSocket fallback', async () => {
+  const f = fixture({ feedCall: async () => {
+    f.manager.abort();
+    throw new TypeError('fetch failed');
+  } });
+  f.onebot.connected = true;
+  let wsReads = 0;
+  f.onebot.callViaWs = async () => { wsReads += 1; return { feeds: [] }; };
+  await assert.rejects(f.manager.runNow('feed'), /Qzone interaction task stopped/);
+  assert.equal(wsReads, 0);
+});
+
+test('learning the real post tid preserves already reviewed feed state', async () => {
+  const feed = [{ uin: 111, key: 'list-key', appid: 311, time: nowSec, html: htmlPost('正文') }];
+  let calls = 0;
+  const f = fixture({ feed, complete: async ({ messages }) => {
+    calls += 1;
+    return response({ feedActions: idsFromMessages(messages, 'feed').map((id) => ({ id, action: 'comment', content: '看到了' })), replyActions: [] });
+  } });
+  await f.manager.runNow('feed');
+  feed[0].tid = 'real-tid';
+  const result = await f.manager.runNow('feed');
+  assert.equal(result.run.discoveredFeeds, 0);
+  assert.equal(result.run.selectedFeeds, 0);
+  assert.equal(calls, 1);
+  assert.equal(f.writes.length, 1);
+  const saved = JSON.parse(fs.readFileSync(f.stateFile));
+  assert.equal(saved.feeds[0].key, '111:real-tid');
+  assert.equal(saved.watchedPosts[0].tid, 'real-tid');
+});
+
+test('empty home timeline reads friend spaces and retains deduplication across polls', async () => {
+  let calls = 0;
+  const f = fixture({ friends: [{ user_id: 111, nickname: '好友' }],
+    friendSpaceCall: async () => ({ msglist: [{ tid: 'personal', time: nowSec, content: '个人空间可读', images: ['https://example.com/photo.jpg'] }] }),
+    complete: async ({ messages }) => {
+      calls += 1;
+      assert.match(messages.at(-1).content, /个人空间可读/);
+      return response({ feedActions: idsFromMessages(messages, 'feed').map((id) => ({ id, action: 'skip' })), replyActions: [] });
+    }
+  });
+  const first = await f.manager.runNow('feed');
+  assert.equal(first.run.feedSource, 'friend-spaces');
+  assert.equal(first.run.selectedFeeds, 1);
+  assert.equal(first.run.friendSpaceFetchStats.succeeded, 1);
+  const second = await f.manager.runNow('feed');
+  assert.equal(second.run.selectedFeeds, 0);
+  assert.equal(calls, 1);
+});
+
+test('failed home timeline still uses readable friend spaces and keeps the original error', async () => {
+  const f = fixture({
+    feedCall: async () => { throw new TypeError('fetch failed'); },
+    friends: [{ user_id: 111 }], friendSpaceCall: async () => ({ msglist: [] })
+  });
+  const result = await f.manager.runNow('feed');
+  assert.equal(result.run.feedError, undefined);
+  assert.match(result.run.feedPrimaryError, /HTTP 连接失败/);
+  assert.equal(result.run.friendSpaceFetchStats.succeeded, 1);
+});
+
+test('friend spaces are bounded, rate limited, rotated and isolated from inaccessible friends', async () => {
+  const calls = [];
+  const sleeps = [];
+  const onebot = { selfId: '888', call: async (action, params) => {
+    if (action === 'get_friend_list') return [
+      ...Array.from({ length: 7 }, (_, i) => ({ user_id: 100 + i })), { user_id: 888 }, { user_id: 'invalid' }
+    ];
+    assert.equal(action, 'get_qzone_msg_list');
+    assert.equal(params.num, 20);
+    calls.push(params.target_uin);
+    if (params.target_uin === 101) throw new Error('permission denied');
+    return { msglist: [{ tid: 'p', time: nowSec, content: 'text', images: [] }, { tid: 'secret', is_private: true }] };
+  } };
+  const first = await fetchQzoneFriendSpaces(onebot, { count: 50, sleep: async (ms) => { sleeps.push(ms); } });
+  assert.deepEqual(calls, [100, 101, 102, 103, 104]);
+  assert.deepEqual(sleeps, [1000, 1000, 1000, 1000]);
+  assert.equal(first.feeds.length, 4);
+  assert.equal(first.stats.failed, 1);
+  calls.length = 0;
+  await fetchQzoneFriendSpaces(onebot, { cursor: first.cursor, sleep: async () => {} });
+  assert.deepEqual(calls, [105, 106, 100, 101, 102]);
+});
+
+test('friend-space failure remains a failure and advances the cursor past broken accounts', async () => {
+  const f = fixture({ friends: [{ user_id: 111 }], friendSpaceCall: async () => { throw new Error('permission denied'); } });
+  const result = await f.manager.runNow('feed');
+  assert.match(result.run.feedError, /个人空间兜底全部失败/);
+  assert.equal(JSON.parse(fs.readFileSync(f.stateFile)).friendFeedCursor, '111');
+});
+
+test('friend-space stop interrupts the batch before another request', async () => {
+  const controller = new AbortController();
+  let calls = 0;
+  const onebot = { call: async (action) => {
+    if (action === 'get_friend_list') return [{ user_id: 111 }, { user_id: 222 }];
+    calls += 1;
+    controller.abort(new Error('stop'));
+    return { msglist: [] };
+  } };
+  await assert.rejects(fetchQzoneFriendSpaces(onebot, { signal: controller.signal, sleep: async () => {} }), /stop/);
+  assert.equal(calls, 1);
+});
+
+test('scheduled friend-space batches establish a baseline for each newly visited friend', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let now = nowMs;
+  let round = 0;
+  let modelCalls = 0;
+  const f = fixture({ now: () => now,
+    friends: Array.from({ length: 6 }, (_, i) => ({ user_id: 100 + i })),
+    friendSpaceCall: async ({ target_uin }) => ({ msglist: [{
+      tid: round && target_uin === 100 ? 'new' : 'old', time: nowSec, content: '正文', images: []
+    }] }),
+    complete: async ({ messages }) => {
+      modelCalls += 1;
+      const ids = idsFromMessages(messages, 'feed');
+      assert.equal(ids.length, 1);
+      return response({ feedActions: ids.map((id) => ({ id, action: 'skip' })), replyActions: [] });
+    }
+  });
+  f.cfg.qzoneInteractions.startupCatchup = false;
+  setRuntimeConfig(f.cfg);
+  try {
+    f.manager.start();
+    t.mock.timers.tick(15000);
+    await f.manager.running;
+    f.manager.stop();
+    assert.equal(modelCalls, 0);
+    round = 1;
+    now += 3600000;
+    f.manager.start();
+    t.mock.timers.tick(15000);
+    await f.manager.running;
+    f.manager.stop();
+    const saved = JSON.parse(fs.readFileSync(f.stateFile));
+    assert.equal(modelCalls, 1);
+    assert.equal(saved.feeds.find((item) => item.key === '105:old').status, 'baseline');
+    assert.equal(saved.friendFeedSeenUins.length, 6);
+  } finally { f.manager.stop(); }
 });
 
 test('interaction prompt keeps the complete configured persona and rejects social prompt injection', () => {

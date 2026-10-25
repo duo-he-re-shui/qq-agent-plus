@@ -48,6 +48,7 @@ let emptyMessage = false;
 const onebot = {
   selfId: '10000001',
   async call(action) {
+    if (action === 'get_friend_list') return [];
     if (action === 'get_qzone_feeds') {
       feedAttempts += 1;
       if (emptyMessage) throw new Error('');

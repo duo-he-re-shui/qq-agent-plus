@@ -89,6 +89,7 @@ const onebot = {
   selfId: '10000001',
   selfNickname: '测试昵称',
   async call(method) {
+    if (method === 'get_friend_list') return [];
     if (method === 'get_qzone_feeds') {
       calls.feed += 1;
       if (failFeeds) throw new Error('OneBot get_qzone_feeds 失败: retcode=100 使用人数过多，请稍后再试');
