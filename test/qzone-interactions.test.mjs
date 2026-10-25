@@ -317,6 +317,25 @@ test('empty home timeline reads friend spaces and retains deduplication across p
   assert.equal(calls, 1);
 });
 
+test('a home timeline containing only self posts also reads friend spaces and preserves self watches', async () => {
+  const f = fixture({
+    feed: [{ uin: 888, key: 'own-post', appid: 311, time: nowSec, html: htmlPost('自己的动态') }],
+    friends: [{ user_id: 111, nickname: '好友' }],
+    friendSpaceCall: async () => ({ msglist: [{ tid: 'friend-post', time: nowSec, content: '好友个人空间正文', images: [] }] }),
+    complete: async ({ messages }) => {
+      assert.match(messages.at(-1).content, /好友个人空间正文/);
+      return response({ feedActions: idsFromMessages(messages, 'feed').map((id) => ({ id, action: 'skip' })), replyActions: [] });
+    }
+  });
+  const result = await f.manager.runNow('feed');
+  assert.equal(result.run.feedSource, 'friend-spaces');
+  assert.equal(result.run.feedPrimaryError, '首页只有自己的动态');
+  assert.equal(result.run.selectedFeeds, 1);
+  assert.equal(result.run.feedFetchStats.self, 1);
+  assert.equal(result.run.feedFetchStats.fetched, 2);
+  assert.ok(JSON.parse(fs.readFileSync(f.stateFile)).watchedPosts.some((post) => post.key === '888:own-post'));
+});
+
 test('failed home timeline still uses readable friend spaces and keeps the original error', async () => {
   const f = fixture({
     feedCall: async () => { throw new TypeError('fetch failed'); },
