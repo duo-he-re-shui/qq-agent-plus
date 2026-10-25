@@ -85,24 +85,28 @@ esac
 [[ -f "$SOURCE_DIR/install.sh" && -f "$SOURCE_DIR/deploy-all.sh" ]] \
   || die "源码目录不完整：$SOURCE_DIR（需要 install.sh 与 deploy-all.sh）"
 
-# 源码不能在部署根目录里（否则 chown/chmod/rsync 会动到你的 checkout），
-# 也不能把部署根目录放进源码里。$ROOT_DIR/src 是安装器自己的副本，允许复用。
-SRC_DIR="$ROOT_DIR/src"
-case "$SOURCE_DIR/" in
-  "$ROOT_DIR/"*)
-    [[ "$SOURCE_DIR" == "$SRC_DIR" ]] \
-      || die "源码不能放在部署根目录里：$SOURCE_DIR（请把仓库 clone 到别处）"
-    ;;
-esac
-case "$ROOT_DIR/" in
-  "$SOURCE_DIR/"*) die "部署根目录不能放在源码目录里：$ROOT_DIR" ;;
-esac
-case "$SOURCE_DIR/" in
-  "$SRC_DIR/"*) die "源码不能放在安装器副本目录里：$SOURCE_DIR" ;;
-esac
-
 # 测试/预览入口：只打印计划，不做任何系统改动。正式路径必须真的是 root。
 TEST_MODE="${QQ_AGENT_ROOT_INSTALL_TEST:-}"
+
+# 源码不能在部署根目录里（否则 chown/chmod/rsync 会动到你的 checkout），
+# 也不能把部署根目录放进源码里。$ROOT_DIR/src 是安装器自己的副本，允许复用。
+# 测试模式跳过：更新器把测试临时目录放在部署根目录下的 checkout 里，
+# 这里只打印计划，不触发 chown/rsync，嵌套不会造成实际破坏。
+SRC_DIR="$ROOT_DIR/src"
+if [[ "$TEST_MODE" != "1" ]]; then
+  case "$SOURCE_DIR/" in
+    "$ROOT_DIR/"*)
+      [[ "$SOURCE_DIR" == "$SRC_DIR" ]] \
+        || die "源码不能放在部署根目录里：$SOURCE_DIR（请把仓库 clone 到别处）"
+      ;;
+  esac
+  case "$ROOT_DIR/" in
+    "$SOURCE_DIR/"*) die "部署根目录不能放在源码目录里：$ROOT_DIR" ;;
+  esac
+  case "$SOURCE_DIR/" in
+    "$SRC_DIR/"*) die "源码不能放在安装器副本目录里：$SOURCE_DIR" ;;
+  esac
+fi
 if [[ "$(id -u)" != "0" && "$TEST_MODE" != "1" ]]; then
   die '这个脚本只应由 root 下的 install.sh 调用；普通用户请直接运行 bash install.sh'
 fi
