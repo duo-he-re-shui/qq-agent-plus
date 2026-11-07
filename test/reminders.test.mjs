@@ -57,7 +57,7 @@ test('ReminderStore：新增/查询/取消/到期/过期与限额', () => {
   // 参数校验
   assert.throws(() => store.add({ chatKey: 'group:1', at: now - 1000, text: 'x' }), /晚于现在/);
   assert.throws(() => store.add({ chatKey: 'group:1', at: now + 60000, text: '   ' }), /不能为空/);
-  assert.throws(() => store.add({ chatKey: 'group:1', at: now + 31 * 24 * 3600 * 1000, text: 'x' }), /30 天/);
+  assert.throws(() => store.add({ chatKey: 'group:1', at: now + 32 * 24 * 3600 * 1000, text: 'x' }), /一个月/);
 
   // 每会话上限 10 条
   const s2 = new ReminderStore(path.join(dataDir, 'reminders-limit.json'));

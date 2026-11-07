@@ -743,7 +743,7 @@ export function buildSystemPrompt({
     // 提醒要按 reminders.enabled 收敛（orchestrator 关掉时会摘掉 remind 工具）：之前这里
     // 无条件教，与工具表不同判（2026-10-07 审计 P1）。
     if (cfgNow.reminders?.enabled !== false) {
-      gameLines.push('- 群友说「提醒我 / 到点叫我 / 明天 9 点提醒 X」时，用 remind 落一条（时间用 HH:MM 或多少分钟后；这是持久化承诺，重启也不丢）。到点你会被唤醒、用你的口吻说出来；改主意用 remind cancel。是「A 让你提醒 B」时（"12 点提醒他吃饭"），to 填 B、from 填 A —— 到点才说得清是谁请你提醒谁，别让被提醒的人以为是自己设的。');
+      gameLines.push('- 群友说「提醒我 / 到点叫我 / 明天 9 点 / 11 月 9 号 10 点提醒 X」时，用 remind 落一条（一个月内任意时刻：date 写 "2026-11-09"（或"11月9日"）+ at 写 "10:00"，也可以 at 直接写 "2026-11-09 10:00"；只说"几点"就把 at 写成 HH:MM，已过算明天；"N 分钟后"用 minutes）。**跨天的请求必须带日期，别用 HH:MM 硬凑"最近的那次"**；设完把回执里的完整落点（含星期）跟对方复述一遍再收尾。这是持久化承诺，重启也不丢。到点你会被唤醒、用你的口吻说出来；改主意用 remind cancel。是「A 让你提醒 B」时（"12 点提醒他吃饭"），to 填 B、from 填 A —— 到点才说得清是谁请你提醒谁，别让被提醒的人以为是自己设的。');
     }
     gameLines.push('- 群友让你"以后叫他 X / 别喊群名片、喊 X"时，用 set_member_note 记下（QQ 号 + 称呼；不确定号码先 get_group_member_list 查）——之后你在聊天记录、成员列表里看到的这个人都会用这个称呼，群名片改了它也不变。');
     if (ttsConfigured(cfgNow)) {
