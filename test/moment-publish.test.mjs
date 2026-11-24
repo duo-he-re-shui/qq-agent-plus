@@ -106,6 +106,14 @@ test('malformed JSON is returned as a tool error, then a corrected decision publ
   assert.equal(f.sends.length, 1);
 });
 
+test('escaped line breaks in public content become real Qzone line breaks', async () => {
+  const f = fixture({ complete: async () => response(decision({ content: '第一段\\n\\n第二段' })) });
+  const result = await f.manager.run({ dayKey, publish: true, source: 'manual-publish' });
+  assert.equal(result.record.content, '第一段\n\n第二段');
+  assert.equal(f.sends[0].content, '第一段\n\n第二段');
+  assert.doesNotMatch(f.sends[0].content, /\\n/);
+});
+
 test('all decision rounds use auto tool choice for thinking-mode compatibility', async () => {
   const toolChoices = [];
   const f = fixture({ complete: async ({ toolChoice }) => {
@@ -170,6 +178,15 @@ test('preview is isolated from publishing, exact draft can publish without anoth
   const again = await f.manager.publishDraft(preview.record.id);
   assert.equal(again.alreadyAttempted, true);
   assert.equal(f.sends.length, 1);
+});
+
+test('legacy preview drafts normalize escaped line breaks at the publish boundary', async () => {
+  const f = fixture();
+  const preview = await f.manager.run({ dayKey, publish: false });
+  preview.record.content = '第一段\\n\\n第二段';
+  const result = await f.manager.publishDraft(preview.record.id);
+  assert.equal(result.record.content, '第一段\n\n第二段');
+  assert.equal(f.sends[0].content, '第一段\n\n第二段');
 });
 
 test('explicit confirmation allows manual same-day draft publishing and regeneration', async () => {

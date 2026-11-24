@@ -13,7 +13,8 @@ export const MAX_REMINDER_TEXT = 200;
 const MAX_PER_CHAT = 10;      // 单个会话待触发上限（防刷）
 const MAX_PENDING = 50;       // 全局待触发上限
 const DONE_KEEP = 5;          // 每个会话保留最近几条已完成记录（供 list 查看）
-const MAX_DELAY_MS = 30 * 24 * 60 * 60 * 1000; // 最多 30 天后（再远没意义）
+export const MAX_DELAY_DAYS = 31;              // "一个月内"按 31 天算（3/1 → 4/1 是 31 天，30 天会差一天）
+export const MAX_DELAY_MS = MAX_DELAY_DAYS * 24 * 60 * 60 * 1000; // 最多一个月后（再远没意义）
 const EXPIRE_AFTER_MS = 12 * 60 * 60 * 1000;   // 离线导致迟到超过 12 小时 → 作废不补发
 
 // ── 周期提醒（repeat）与 IANA 时区 ─────────────────────────────────────────
@@ -200,9 +201,8 @@ export function normalizeRepeat(raw) {
     if (!parseCron5(String(raw.cron || ''))) throw new Error('cron 表达式不合法（5 字段，日/月只认 *）');
     return { kind, cron: String(raw.cron).trim(), ...(tz ? { tz } : {}), ...(jitterMs ? { jitterMs } : {}) };
   }
-  // 缺省与字符串写法同口径：只给 kind 时按 09:00；给了 hour 没给 minute 按整点。
-  const hour = raw.hour === undefined ? 9 : Number(raw.hour);
-  const minute = raw.minute === undefined ? 0 : Number(raw.minute);
+  const hour = Number(raw.hour);
+  const minute = Number(raw.minute);
   if (!Number.isInteger(hour) || hour < 0 || hour > 23 || !Number.isInteger(minute) || minute < 0 || minute > 59) {
     throw new Error('repeat 需要 hour(0-23) 与 minute(0-59)');
   }
@@ -227,6 +227,110 @@ export function nextAtFromHHMM(hhmm, now = Date.now()) {
   if (deltaMin <= 0) deltaMin += 24 * 60;   // 已过（或就是此刻）→ 明天同一时刻
   return now + deltaMin * 60 * 1000;
 }
+
+// ── 绝对时间（"11 月 9 日 10:00"）──────────────────────────────────────────
+// 旧口径只认 HH:MM：最多只能表达 24 小时内的未来时刻，跨天请求（"下周一 10 点"）
+// 在参数层面根本落不了地 —— 2026-11-07 线上事故：模型只能反复 cancel/add 拿
+// "最近的 10:00" 硬凑，4 轮把 Token 预算烧光，最后只发出一条兜底文案。
+// 这里补上带日期的写法（最多一个月内），钟点仍按项目统一时区 UTC+8 解释。
+const SHANGHAI_OFFSET_MS = 8 * 60 * 60 * 1000;
+const WEEKDAY_CN = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+
+function pad2(n) {
+  return String(n).padStart(2, '0');
+}
+
+/** 上海挂钟字段 → 绝对毫秒；2 月 30 日、13 月、25 点这类非法值返回 null（靠回读校验）。 */
+function shanghaiWallToMs({ year, month, day, hour, minute }) {
+  const ms = Date.UTC(year, month - 1, day, hour, minute) - SHANGHAI_OFFSET_MS;
+  const back = new Date(ms + SHANGHAI_OFFSET_MS);
+  if (back.getUTCFullYear() !== year || back.getUTCMonth() + 1 !== month || back.getUTCDate() !== day
+    || back.getUTCHours() !== hour || back.getUTCMinutes() !== minute) return null;
+  return ms;
+}
+
+const REMINDER_DATE_PATTERNS = [
+  /^(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})[日号]?$/,   // 2026-11-09 / 2026/11/09 / 2026年11月9日
+  /^(\d{1,2})[-/.月](\d{1,2})[日号]?$/                 // 11-09 / 11/09 / 11月9日
+];
+
+/** 解析"哪天"：返回 { year?, month, day }；不带年时由调用方按当前年解释。非法返回 null。 */
+export function parseReminderDate(input) {
+  const text = String(input ?? '').trim();
+  if (!text) return null;
+  const m = REMINDER_DATE_PATTERNS[0].exec(text) || REMINDER_DATE_PATTERNS[1].exec(text);
+  if (!m) return null;
+  const hasYear = m.length === 4;
+  const year = hasYear ? Number(m[1]) : undefined;
+  const month = Number(m[hasYear ? 2 : 1]);
+  const day = Number(m[hasYear ? 3 : 2]);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  return { ...(hasYear ? { year } : {}), month, day };
+}
+
+/**
+ * 解析提醒时间，返回 { at, explicitDate, hour, minute } 或 null。
+ * - "10:00"            → 下一个该钟点（最多 24 小时内，沿用旧语义）
+ * - "2026-11-09 10:00" → 指定时刻（也收 T 分隔、/ 或 . 分隔、中文"11月9日"）
+ * - at="10:00" + date="2026-11-09" → 拼成指定时刻
+ * 带日期但不带年时按**当前年**解释：跨年请把年写全（不然"1 月 2 号"会被静默推到明年）。
+ * 已过去的时间原样返回（由调用方给出"已经过去了"的可读错误，而不是在这里返回 null 让人猜）。
+ */
+export function parseReminderTime(input, { now = Date.now(), date = '' } = {}) {
+  const text = String(input ?? '').trim();
+  const dateText = String(date ?? '').trim();
+  let dateParts = null;
+  let timeText = text;
+  const split = /^(.+?)[\sT]+(.+)$/.exec(text);
+  if (split) {
+    dateParts = parseReminderDate(split[1]);
+    if (!dateParts) return null;
+    timeText = split[2].trim();
+  } else if (dateText) {
+    dateParts = parseReminderDate(dateText);
+    if (!dateParts) return null;
+  }
+  const t = /^(\d{1,2})[:：](\d{2})(?::\d{2})?$/.exec(timeText);
+  if (!t) return null;
+  const hour = Number(t[1]);
+  const minute = Number(t[2]);
+  if (hour > 23 || minute > 59) return null;
+  if (!dateParts) {
+    return { at: nextAtFromHHMM(`${pad2(hour)}:${pad2(minute)}`, now), explicitDate: false, hour, minute };
+  }
+  const year = dateParts.year ?? new Date(now + SHANGHAI_OFFSET_MS).getUTCFullYear();
+  const at = shanghaiWallToMs({ year, month: dateParts.month, day: dateParts.day, hour, minute });
+  if (at === null) return null;
+  return { at, explicitDate: true, hour, minute };
+}
+
+/** 给人/模型看的完整落点："2026-11-09 10:00（周一）"。带星期是为了不再把 11/08 看成 11/09。 */
+export function formatReminderAt(ms) {
+  const d = new Date(Number(ms) + SHANGHAI_OFFSET_MS);
+  return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())} `
+    + `${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}（${WEEKDAY_CN[d.getUTCDay()]}）`;
+}
+
+/** 显式日期 + repeat 是否自洽：不自洽返回可读原因，自洽返回 null（调用方据此报错而不是默默跑歪）。 */
+export function checkRepeatMatch(repeat, at) {
+  if (!repeat || typeof repeat !== 'object') return null;
+  const wall = new Date(Number(at) + SHANGHAI_OFFSET_MS);
+  const dow = wall.getUTCDay();
+  if (repeat.kind === 'weekly' && Number(repeat.weekday) !== dow) {
+    const want = WEEKDAY_CN[Number(repeat.weekday) % 7];
+    return `date 是${WEEKDAY_CN[dow]}，但 repeat 是每${want}；要么改日期，要么去掉 repeat`;
+  }
+  if (repeat.kind === 'cron') {
+    const parsed = parseCron5(repeat.cron);
+    if (!parsed) return 'repeat 的 cron 不合法';
+    if (!parsed.minutes.has(wall.getUTCMinutes()) || !parsed.hours.has(wall.getUTCHours())
+      || !parsed.dows.has(dow)) {
+      return `date 的 ${pad2(wall.getUTCHours())}:${pad2(wall.getUTCMinutes())} 和 repeat 的 cron 对不上`;
+    }
+  }
+  return null;
+}
+
 
 export class ReminderStore {
   constructor(file = FILE) {
@@ -298,7 +402,7 @@ export class ReminderStore {
     if (!Number.isFinite(when)) throw new Error('提醒时间不合法');
     const now = Date.now();
     if (when <= now + 5000) throw new Error('提醒时间必须晚于现在');
-    if (when - now > MAX_DELAY_MS) throw new Error('最多只能设到 30 天后');
+    if (when - now > MAX_DELAY_MS) throw new Error(`最多只能设到 ${MAX_DELAY_DAYS} 天后（约一个月）`);
     // #9：先把"早就过期、还没被巡检标掉"的项标成 expired（它们才是真占着 pending 名额的那批），
     // 再剪留档，最后判上限 —— 否则用户会因为一堆早该作废的提醒而被告知"满了"。
     let expiredNow = false;
@@ -315,7 +419,7 @@ export class ReminderStore {
     const repeatNormalized = normalizeRepeat(repeat);
     if (repeatNormalized) {
       // 周期项：传入的 at 只是"第一次触发点"，之后 markFired 自动续
-      if (when - now > MAX_DELAY_MS) throw new Error('首次触发最多只能设到 30 天后');
+      if (when - now > MAX_DELAY_MS) throw new Error(`首次触发最多只能设到 ${MAX_DELAY_DAYS} 天后`);
     }
     const item = {
       id: crypto.randomBytes(4).toString('hex'),

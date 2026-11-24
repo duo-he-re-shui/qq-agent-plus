@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DATA_DIR, getConfig } from '../core/config.js';
 import { backupPersonBeforeConsolidation } from './memory-consolidation-backup.js';
+import { normalizeImpressionVisibility } from '../core/memory-visibility.js';
 
 const MEMORY_DIR = path.join(DATA_DIR, 'memory');
 const PEOPLE_DIR = path.join(MEMORY_DIR, 'people');
@@ -94,17 +95,20 @@ function normalizeOrigin(raw) {
   return IMPRESSION_ORIGINS.includes(value) ? value : '';
 }
 
-function normalizeEntry(raw, fallbackChatKey = '') {
+function normalizeEntry(raw, fallbackChatKey = '', defaultVisibility = '') {
   const content = clean(raw?.content ?? raw);
   if (!content) return null;
   const createdAt = Number(raw?.createdAt) || Date.now();
-  return {
+  const entry = {
     content,
     createdAt,
     lastObservedAt: Math.max(createdAt, Number(raw?.lastObservedAt) || 0),
     origin: normalizeOrigin(raw?.origin),
     sourceChatKeys: sourceKeys(raw?.sourceChatKeys, raw?.sourceChatKey || fallbackChatKey)
   };
+  const visibility = normalizeImpressionVisibility(raw?.visibility, defaultVisibility);
+  if (visibility) entry.visibility = visibility;
+  return entry;
 }
 function mergeEntry(member, entry) {
   const old = member.impressions.find((x) => x.content === entry.content);
@@ -116,6 +120,7 @@ function mergeEntry(member, entry) {
   old.createdAt = Math.min(Number(old.createdAt) || entry.createdAt, entry.createdAt);
   old.lastObservedAt = Math.max(Number(old.lastObservedAt) || old.createdAt, entry.lastObservedAt || entry.createdAt);
   old.sourceChatKeys = sourceKeys([...(old.sourceChatKeys || []), ...(entry.sourceChatKeys || [])]);
+  if (entry.visibility) old.visibility = entry.visibility;
 }
 function normalizeMember(raw = {}, userId = '', name = '', fallbackChatKey = '') {
   const member = emptyMember(raw.userId ?? userId, raw.name ?? name);
@@ -258,6 +263,23 @@ export class GlobalPersonMemoryStore {
     const uid = String(userId || '').trim();
     return structuredClone(this.#ensure().get(uid) || emptyMember(uid));
   }
+  /** 控制台只改一条范围，不用整份 replace 覆盖并发新增的印象。 */
+  setImpressionVisibility(userId, content, visibility) {
+    const scope = normalizeImpressionVisibility(visibility);
+    if (!scope) throw new Error('visibility 必须为 global、person、private 或 local');
+    const member = this.#ensure().get(String(userId || '').trim());
+    const entry = member?.impressions.find((item) => item.content === String(content || '').trim());
+    if (!entry) throw new Error('这条印象已不存在，请刷新后重试');
+    if (entry.visibility === scope) return structuredClone(entry);
+    backupPersonBeforeConsolidation(member, { sourceChatKey: '', at: Date.now(), reason: 'manual-visibility' });
+    const next = structuredClone(member);
+    const changed = next.impressions.find((item) => item.content === entry.content);
+    changed.visibility = scope;
+    next.updatedAt = Date.now();
+    this.#persist(next);
+    this.#ensure().set(String(userId).trim(), next);
+    return structuredClone(changed);
+  }
   /**
    * 记一次互动（只更新已经有印象的人，不为陌生人建档案）。
    * 关系温度只影响提示词里的一行标签，不参与检索/排序。
@@ -277,16 +299,21 @@ export class GlobalPersonMemoryStore {
     this.#persist(member);
     return structuredClone(rel);
   }
-  append(chatKey, userId, name, content, createdAt = Date.now(), origin = 'model', lastObservedAt = 0) {
+  append(chatKey, userId, name, content, createdAt = Date.now(), origin = 'model', lastObservedAt = 0, visibility = '') {
     const map = this.#ensure();
     const key = memberKey(userId, name);
     const member = map.get(key) || emptyMember(userId, name);
     const now = Date.now();
+    const previous = member.impressions.find((item) => item.content === clean(content));
+    // 再次观察不改变人工设定的范围；只有显式传范围才允许覆盖。
+    const scope = normalizeImpressionVisibility(visibility)
+      || (previous ? previous.visibility : normalizeImpressionVisibility(getConfig().memory?.visibility?.default, 'global'));
     // lastObservedAt 默认取当下（"现在又看到了一次"）；只有把遗留记录并进来时才传它的旧时间 ——
     // 否则那条一年前的印象会被当成今天观察到的：日期前缀显示成今天、按新旧挑最近 3 条时挤掉真正新的、
     // "90 天没再观察到就删"的规则也永远不成立。
     const entry = normalizeEntry({
-      content, createdAt, lastObservedAt: Number(lastObservedAt) || now, origin, sourceChatKeys: [chatKey]
+      content, createdAt, lastObservedAt: Number(lastObservedAt) || now, origin, visibility: scope,
+      sourceChatKeys: [chatKey]
     }, chatKey);
     if (!entry) return null;
     mergeEntry(member, entry);
@@ -295,7 +322,7 @@ export class GlobalPersonMemoryStore {
     member.sourceChatKeys = sourceKeys([...member.sourceChatKeys, chatKey]);
     member.updatedAt = now;
     this.#persist(member); map.set(memberKey(member.userId, member.name), member);
-    return structuredClone(entry);
+    return structuredClone(member.impressions.find((item) => item.content === entry.content));
   }
   /**
    * 把一批"只有名字、没有 QQ 号"的遗留印象并到反查出来的那个人名下。
@@ -308,10 +335,15 @@ export class GlobalPersonMemoryStore {
     for (const entry of Array.isArray(entries) ? entries : []) {
       const content = clean(entry?.content ?? entry, 300);
       if (!content) continue;
-      const source = sourceKeys(entry?.sourceChatKeys)[0] || String(chatKey || '');
+      const sources = sourceKeys(entry?.sourceChatKeys, String(chatKey || ''));
       // 连同"最后一次观察到"的旧时间一起搬过来（缺了就退回 createdAt）：并记录 ≠ 重新观察到
       const observed = Number(entry?.lastObservedAt) || Number(entry?.createdAt) || 0;
-      const saved = this.append(source, uid, name, content, Number(entry?.createdAt) || Date.now(), String(entry?.origin || ''), observed);
+      const previous = this.#ensure().get(uid)?.impressions.find((item) => item.content === content);
+      const visibility = previous ? previous.visibility || 'global' : entry?.visibility || 'global';
+      let saved = null;
+      for (const source of sources) {
+        saved = this.append(source, uid, name, content, Number(entry?.createdAt) || Date.now(), String(entry?.origin || ''), observed, visibility);
+      }
       if (saved) adopted += 1;
     }
     return adopted;
@@ -319,13 +351,34 @@ export class GlobalPersonMemoryStore {
   replace(chatKey, userId, name, contents, { origin = 'consolidated' } = {}) {
     const uid = String(userId || '').trim();
     if (!/^\d{1,15}$/.test(uid)) throw new Error('userId 必须是数字 QQ 号');
+    for (const item of Array.isArray(contents) ? contents : [contents]) {
+      if (item && typeof item === 'object' && Object.hasOwn(item, 'visibility')
+        && !normalizeImpressionVisibility(item.visibility)) {
+        throw new Error('visibility 必须为 global、person、private 或 local');
+      }
+    }
     const map = this.#ensure();
     const old = map.get(uid) || emptyMember(uid, name);
     const finalName = clean(name, 60) || old.name || uid;
     const now = Date.now();
+    const defaultVisibility = normalizeImpressionVisibility(getConfig().memory?.visibility?.default, 'global') || 'global';
     const incoming = (Array.isArray(contents) ? contents : [contents])
-      .map((x) => clean(x)).filter(Boolean).slice(0, 20);
+      .map((item) => {
+        const content = clean(item?.content ?? item);
+        if (!content) return null;
+        return { content, visibility: normalizeImpressionVisibility(item?.visibility) };
+      }).filter(Boolean).slice(0, 20);
     const hadSource = old.sourceChatKeys.includes(String(chatKey || '').trim());
+    const previous = new Map((old.impressions || []).map((entry) => [String(entry.content), entry]));
+    const previousScopes = new Set(old.impressions.map((entry) => entry.visibility || 'global'));
+    const rewriting = incoming.some((item) => !previous.has(item.content));
+    // 整理模型并不知道每一句新摘要来自哪条旧印象。范围混合时不猜、不扩大权限。
+    if (origin === 'consolidated' && hadSource && rewriting
+      && previousScopes.size > 1 && [...previousScopes].some((scope) => scope !== 'global')) {
+      throw new Error('人物印象包含不同可见范围，无法安全合并改写；请先在控制台分别编辑或统一范围');
+    }
+    const rewrittenVisibility = origin === 'consolidated' && hadSource && previousScopes.size === 1
+      && !previousScopes.has('global') ? [...previousScopes][0] : defaultVisibility;
     let member;
     if (old.impressions.length && !hadSource) {
       // A globally known person can appear in a new chat before that chat has ever written memory.
@@ -336,12 +389,15 @@ export class GlobalPersonMemoryStore {
       member.name = finalName;
       member.updatedAt = now;
       member.sourceChatKeys = sourceKeys([...member.sourceChatKeys, chatKey]);
-      for (const content of incoming) {
+      for (const item of incoming) {
+        const prev = previous.get(item.content);
         mergeEntry(member, {
-          content,
+          content: item.content,
           createdAt: now,
           lastObservedAt: now,
           origin: normalizeOrigin(origin),
+          ...(item.visibility || prev?.visibility || !prev
+            ? { visibility: item.visibility || prev?.visibility || defaultVisibility } : {}),
           sourceChatKeys: sourceKeys([chatKey])
         });
       }
@@ -350,13 +406,13 @@ export class GlobalPersonMemoryStore {
       // 内容没变的条目沿用旧时间戳 —— 整理只是"改写/合并"，不是"重新观察到"。
       // 以前这里一律赋 now：每次整理都把全部印象的年龄刷成当天，展示端的日期前缀
       // 变成"上次整理日期"，"90 天没再观察到就删"这类规则也永远不成立。
-      const previous = new Map((old.impressions || []).map((e) => [String(e.content), e]));
       member = {
         version: 2, userId: uid, name: finalName, sourceChatKeys: sources,
         updatedAt: now, lastConsolidatedAt: old.lastConsolidatedAt || 0,
         // 关系是独立于"印象正文"的计数：整理只改写印象，不该把聊过多少次清零。
         relationship: normalizeRelationship(old.relationship),
-        impressions: incoming.map((content) => {
+        impressions: incoming.map((item) => {
+          const content = item.content;
           const prev = previous.get(String(content));
           const createdAt = Number(prev?.createdAt) || now;
           // 每条印象**自己**的来源要如实：正文原样保留的沿用旧来源，新写/改写过的只算这次整理的会话。
@@ -369,6 +425,8 @@ export class GlobalPersonMemoryStore {
             lastObservedAt: Math.max(createdAt, Number(prev?.lastObservedAt) || 0),
             // 正文没变就沿用旧来源（整理原样保留的一条，不该被记成"整理改写的"）
             origin: prev ? normalizeOrigin(prev.origin) : normalizeOrigin(origin),
+            ...(item.visibility || prev?.visibility || !prev
+              ? { visibility: item.visibility || prev?.visibility || rewrittenVisibility } : {}),
             sourceChatKeys: prevSources.length ? prevSources : sourceKeys([chatKey])
           };
         })

@@ -4236,7 +4236,7 @@ try {
     const savedStatus = String(document.getElementById('gm-newimp-status')?.textContent || '');
     const savedOk = Boolean(put)
       && put.url.includes('/api/memory-files/group_1/members/77777')
-      && JSON.stringify(put.body?.impressions) === JSON.stringify(['爱钓鱼', '周末常不在'])
+      && JSON.stringify(put.body?.impressions) === JSON.stringify(['爱钓鱼', { content: '周末常不在', visibility: 'global' }])
       && put.body?.note === '代号老王'
       && put.body?.name === ''
       && savedStatus.includes('已保存：77777');
@@ -4275,7 +4275,7 @@ try {
     posts.length = 0;
     if (saveHandler) await saveHandler({ currentTarget: saveBtn });
     const putFresh = posts.find((p) => p.method === 'PUT');
-    const freshOk = JSON.stringify(putFresh?.body?.impressions) === JSON.stringify(['爱钓鱼', '刚记的', '刚加的']);
+    const freshOk = JSON.stringify(putFresh?.body?.impressions) === JSON.stringify(['爱钓鱼', '刚记的', { content: '刚加的', visibility: 'global' }]);
 
     // ⑤ 服务端截断（每位最多 20 条，截的是尾部 → 新加的排最后）：要说清没写进去，
     //    并且**输入框保留内容**（原来无条件清空，用户以为写进去了）

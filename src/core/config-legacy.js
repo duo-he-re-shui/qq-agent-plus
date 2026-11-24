@@ -800,8 +800,8 @@ export const DEFAULT_CONFIG = {
     useChatModel: true,                   // true = 整理模型跟随聊天模型；false = 使用下方专用模型
     provider: '',                         // 专用模型所属提供商 id（useChatModel=false 时生效）
     model: '',                            // 专用模型 id（useChatModel=false 时生效）
-    // 记忆可见性（#13）：默认与历史行为逐字一致（global + 不隐藏），切换必须显式操作
-    visibility: { mode: 'global', hidePrivateInGroup: false }
+    // 记忆可见性：默认范围可在控制台调整；mode/hidePrivateInGroup 保留旧版兼容
+    visibility: { default: 'global', mode: 'global', hidePrivateInGroup: false }
   },
   // 省 Token 模式：只给"可控项"夹上限（上下文档位条数、单次运行轮数与预算、
   // 交接/印象注入字符数、提示词里的表情清单条数），不改写上面那些用户填的值。

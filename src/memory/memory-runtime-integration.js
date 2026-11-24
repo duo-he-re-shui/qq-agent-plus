@@ -15,7 +15,7 @@ let patched = false;
  *   **空串 = 管理视图**（无"当前会话"语义）：不做 perChat 过滤，只保留默认策略；
  *   否则控制台人物列表 / 手动好友评分会被某个群的 perChat 策略整片滤空。
  */
-function normalizeMemoryView(userId, maxMemories = 6, chatKey = '') {
+function normalizeMemoryView(userId, maxMemories = 6, chatKey = '', participantUserIds = []) {
   if (!activeMemoryStore) {
     return {
       globalMemories: [],
@@ -29,8 +29,9 @@ function normalizeMemoryView(userId, maxMemories = 6, chatKey = '') {
   // #13：按 memory.visibility 过滤到「对当前会话可见」的印象（默认策略下与历史逐字一致）。
   // 无 chatKey（管理视图）时只按 global+不隐藏走 —— 等价于不按会话过滤。
   const vis = memoryVisibilityOf();
-  const scoped = chatKey ? vis : { ...vis, mode: 'global' };
-  const visible = visibleImpressions(impressions, chatKey, scoped);
+  const visible = chatKey ? visibleImpressions(impressions, chatKey, vis, {
+    subjectUserId: userId, participantUserIds
+  }) : impressions;
   const sorted = [...visible]
     .sort((a, b) => (Number(b.lastObservedAt) || Number(b.createdAt) || 0)
       - (Number(a.lastObservedAt) || Number(a.createdAt) || 0));
@@ -57,9 +58,9 @@ function normalizeMemoryView(userId, maxMemories = 6, chatKey = '') {
   };
 }
 
-function attachGlobalMemory(person, maxMemories = 6, chatKey = '') {
+function attachGlobalMemory(person, maxMemories = 6, chatKey = '', participantUserIds = []) {
   if (!person) return person;
-  const memory = normalizeMemoryView(person.userId, maxMemories, chatKey);
+  const memory = normalizeMemoryView(person.userId, maxMemories, chatKey, participantUserIds);
   return {
     ...person,
     // 统一记忆字段：IdentityStore 只负责身份；人物长期记忆只从 MemoryStore 读取。
@@ -88,7 +89,9 @@ function patchIdentityStore() {
     IdentityStore.prototype.getPerson = function getPersonWithGlobalMemory(userId, options = {}) {
       const person = originalGetPerson.call(this, userId, options);
       // chatKey 必须透传：可见性按会话判（perChat / hidePrivateInGroup）。
-      return attachGlobalMemory(person, options?.maxMemories, options?.chatKey);
+      const participantUserIds = Array.isArray(options?.participantUserIds) ? options.participantUserIds
+        : (options?.chatKey && this.hasSource(userId, options.chatKey) ? [String(userId)] : []);
+      return attachGlobalMemory(person, options?.maxMemories, options?.chatKey, participantUserIds);
     };
   }
 

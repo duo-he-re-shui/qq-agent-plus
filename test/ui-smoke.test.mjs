@@ -819,6 +819,105 @@ test('真实 DOM 冒烟：人物记忆页 15s 轮询不叠监听（点一次「�
   } finally { window.happyDOM?.abort?.(); }
 });
 
+test('真实 DOM 冒烟：人物印象范围逐条即时保存，新增印象带上所选范围', { skip: SKIP }, async () => {
+  const { window } = loadPage();
+  await settle();
+  try {
+    const doc = window.document;
+    const calls = [];
+    const originalFetch = window.fetch;
+    const person = {
+      userId: '60606', name: '范围测试者', updatedAt: 1700000000000,
+      sourceChatKeys: ['group:10001'], impressions: [
+        { content: '旧印象', visibility: 'person', sourceChatKeys: ['group:10001'] }
+      ]
+    };
+    window.fetch = async (url, options = {}) => {
+      const target = String(url);
+      const method = String(options.method || 'GET').toUpperCase();
+      const body = options.body ? JSON.parse(options.body) : null;
+      calls.push({ target, method, body });
+      if (target.includes('/api/memory-files/global/members/60606/visibility')) {
+        return { ok: true, status: 200, json: async () => ({ ok: true, entry: { content: body.content, visibility: body.visibility } }) };
+      }
+      if (target.includes('/api/memory-files/group_10001')) {
+        if (method === 'PUT') return { ok: true, status: 200, json: async () => ({ member: { impressions: body.impressions } }) };
+        return { ok: true, status: 200, json: async () => ({ members: [structuredClone(person)] }) };
+      }
+      if (target.includes('/api/memory-files')) {
+        return { ok: true, status: 200, json: async () => ({ files: [{ chatKey: 'group:10001', impressionCount: 1 }] }) };
+      }
+      return originalFetch(url, options);
+    };
+
+    window.switchTab('people-memory');
+    window.dispatchEvent(new window.Event('focus'));
+    await settle(80);
+    const personButton = doc.querySelector('#global-memory-items [data-gm-key]');
+    assert.ok(personButton, `人物列表应加载${doc.getElementById('global-memory-items')?.innerHTML}`);
+    personButton.click();
+    await settle(40);
+    const visibility = doc.querySelector('[data-gm-visibility="0"]');
+    assert.ok(visibility, '印象详情应提供可见范围下拉');
+    assert.equal(visibility.value, 'person');
+    visibility.value = 'private';
+    visibility.dispatchEvent(new window.Event('change', { bubbles: true }));
+    await settle(80);
+    const saved = calls.find((call) => call.method === 'PUT' && call.target.includes('/visibility'));
+    assert.deepEqual(saved?.body, { content: '旧印象', visibility: 'private' });
+    assert.equal(doc.querySelector('[data-gm-visibility-status="0"]')?.textContent, '已保存');
+
+    doc.querySelector('#gm-newimp')?.setAttribute('open', '');
+    await settle(40);
+    const newVisibility = doc.getElementById('gm-newimp-visibility');
+    assert.ok(newVisibility, '新增印象表单应能选择范围');
+    assert.equal(newVisibility.value, 'global', '旧配置默认 global');
+    newVisibility.value = 'local';
+    doc.getElementById('gm-newimp-qq').value = person.userId;
+    doc.getElementById('gm-newimp-chat').value = 'group:10001';
+    doc.getElementById('gm-newimp-text').value = '新印象';
+    doc.getElementById('gm-newimp-save').click();
+    await settle(100);
+    const created = calls.find((call) => call.method === 'PUT' && call.target.endsWith('/members/60606'));
+    assert.deepEqual(created?.body?.impressions, ['旧印象', { content: '新印象', visibility: 'local' }]);
+  } finally { window.happyDOM?.abort?.(); }
+});
+
+test('真实 DOM 冒烟：新记忆默认范围可以保存并回显，已有额外限制保留', { skip: SKIP }, async () => {
+  const { window } = loadPage();
+  await settle();
+  try {
+    const doc = window.document;
+    const calls = [];
+    const originalFetch = window.fetch;
+    window.fetch = async (url, options = {}) => {
+      if (String(url).includes('/api/config') && String(options.method || 'GET').toUpperCase() === 'POST') {
+        const body = JSON.parse(options.body);
+        calls.push(body);
+        const cfg = await (await originalFetch('/api/config')).json();
+        return { ok: true, status: 200, json: async () => ({ config: { ...cfg, ...body } }) };
+      }
+      return originalFetch(url, options);
+    };
+    window.switchTab('settings');
+    await settle(80);
+    doc.querySelector('.settings-menu-item[data-section="memory"]').click();
+    await settle(80);
+    const scope = doc.getElementById('cfg-mem-default-visibility');
+    assert.equal(scope.options.length, 4);
+    assert.equal(scope.value, 'global');
+    scope.value = 'person';
+    doc.getElementById('cfg-mem-visibility').value = 'perChat';
+    doc.getElementById('cfg-mem-hideprivate').checked = true;
+    doc.getElementById('save-cfg-btn').click();
+    await settle(160);
+    assert.equal(calls.at(-1).memory.visibility.default, 'person');
+    assert.equal(calls.at(-1).memory.visibility.mode, 'perChat');
+    assert.equal(calls.at(-1).memory.visibility.hidePrivateInGroup, true);
+    assert.equal(doc.getElementById('cfg-mem-default-visibility').value, 'person');
+  } finally { window.happyDOM?.abort?.(); }
+});
+
 test('真实 DOM 冒烟：每日动态状态块的群摘要展开态在轮询重建后保持（2026-10-12 审查）', { skip: SKIP }, async () => {
   // loadDailyMomentsStatus 每次都把整块 innerHTML 重写：`<details>` 的展开态不在 HTML 里，
   // 不记住就会每 15 秒折叠一次、正在读摘要的人被反复打断。

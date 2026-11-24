@@ -25,13 +25,13 @@ export class MemoryStore extends BaseMemoryStore {
    * mode='perChat' 只返回来源含当前会话的印象；hidePrivateInGroup 时群聊里剔除私聊来源。
    * 默认（global + 不隐藏）与历史行为逐字一致。
    */
-  query(chatKey, category = '') {
+  query(chatKey, category = '', { participantUserIds = [] } = {}) {
     if (category && category !== 'memberImpression') return { [category]: [] };
     const vis = memoryVisibilityOf();
     const memberImpression = [];
     for (const member of this.people.members()) {
       for (const entry of member.impressions || []) {
-        if (!impressionVisible(entry, chatKey, vis)) continue;
+        if (!impressionVisible(entry, chatKey, vis, { subjectUserId: member.userId, participantUserIds })) continue;
         memberImpression.push({
           userId: String(member.userId || ''),
           target: String(member.name || member.userId || '某人'),
@@ -40,6 +40,7 @@ export class MemoryStore extends BaseMemoryStore {
           createdAt: entry.createdAt,
           lastObservedAt: entry.lastObservedAt,
           origin: entry.origin || '',
+          visibility: entry.visibility || 'global',
           sourceChatKeys: Array.isArray(entry.sourceChatKeys) ? [...entry.sourceChatKeys] : []
         });
       }

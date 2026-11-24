@@ -168,6 +168,12 @@ function cleanText(value, max = 500) {
   return sanitizeUserText(String(value ?? '').replace(/\0/g, '').replace(/[ \t]+/g, ' ').trim()).slice(0, max);
 }
 
+function normalizePublicContent(value) {
+  // 模型有时会把换行再转义一层，工具参数解析后留下字面量 "\\n"；Qzone
+  // 会按普通字符展示它，所以在公开正文出口还原成真正的换行。
+  return String(value ?? '').replace(/\\r\\n/g, '\n').replace(/\\n/g, '\n').replace(/\\r/g, '\n');
+}
+
 function momentError(code, message, httpStatus = 409) {
   return Object.assign(new Error(message), { code, httpStatus });
 }
@@ -177,7 +183,7 @@ function redactPublicContent(value, snapshot) {
   // 先把链接摘出来：源头链接里带一串数字很常见（`/p/12345`），连它一起换掉会把正文里唯一
   // 可核实的东西弄成 `[号码已隐藏]`（2026-10-14 复审）。占位符用 \0 包住，号码替换必然穿不过去。
   const urls = [];
-  let text = cleanText(value, 1000).replace(/https?:\/\/[^\s，。！？；、"'”）)】]+/g, (url) => `\0${urls.push(url) - 1}\0`);
+  let text = cleanText(normalizePublicContent(value), 1000).replace(/https?:\/\/[^\s，。！？；、"'”）)】]+/g, (url) => `\0${urls.push(url) - 1}\0`);
   text = text.replace(/(?<!\d)[1-9]\d{4,14}(?!\d)/g, '[号码已隐藏]');
   text = text.replace(/\0(\d+)\0/g, (_m, index) => urls[Number(index)] ?? '');
   for (const group of snapshot.groups) {
@@ -568,9 +574,9 @@ export class DailyMomentsManager {
 
   async #exclusive(task, execute) {
     if (this.running) throw momentError('MOMENT_BUSY', '已有动态任务正在执行，请等待完成');
-    // 「核对 / 确认结果 / 编辑草稿」都是本地操作：编辑不在活跃时段也应该能做
-    //（否则管理员只能等窗口，草稿会被卡住 —— 2026-10-24 审查 P2）。
-    if (!['reconcile', 'resolve-record', 'edit-draft'].includes(task)) assertTimeAllowed('');
+    // 「核对 / 确认结果」是消除 publish-unknown 阻断的唯一出口，且只读+写本地记录：
+    // 非活跃时段把它们拦下，管理员点不动、窗口模式会一直卡在 pending（2026-10-13 全项目审查 P3-4）。
+    if (task !== 'reconcile' && task !== 'resolve-record') assertTimeAllowed('');
     this.setProactiveSuppressed(true);
     this.task = task;
     this.running = Promise.resolve().then(execute).finally(() => {
@@ -934,6 +940,11 @@ export class DailyMomentsManager {
     force = false,
     confirmDuplicateRisk = false
   } = {}) {
+    const normalizedContent = normalizePublicContent(record.content);
+    if (normalizedContent !== record.content) {
+      record.content = normalizedContent;
+      this.#saveRecord(record);
+    }
     this.#assertPublishAllowed(record, signal);
     const blocked = this.#blockingRecord(record, true);
     if (blocked && force && !confirmDuplicateRisk) {
@@ -1010,21 +1021,19 @@ export class DailyMomentsManager {
       if (record.status !== 'preview' || record.decision !== 'publish') {
         throw momentError('MOMENT_NOT_DRAFT', '只有待发布的草稿可以编辑', 409);
       }
-      const text = String(content ?? '').trim();
+      const text = normalizePublicContent(content).trim();
       if (!text) throw momentError('MOMENT_DECISION_INVALID', '正文不能为空', 422);
       if (text.length > 2000) throw momentError('MOMENT_DECISION_INVALID', '正文太长（上限 2000 字）', 422);
-      // 先校验、后赋值：record 是内存里同一个对象，旧实现先写 record.content 再校验，
-      // 校验失败只抛错不落盘 —— 但内存已经是违规正文，之后直接点发布就会把它发出去
-      //（2026-10-24 审查 P1）。
+      record.content = text;
+      record.editedAt = this.now();
+      record.editedBy = 'manual';
+      // 编辑后的正文同样要过诚实边界（人也会顺手编；闸门不区分谁写的）
       if (record.contentSource === 'self') {
         const fabricated = fabricationReason(text);
         if (fabricated) {
           throw momentError('MOMENT_DECISION_INVALID', `编辑后的正文${fabricated}，self 模式不发现实行动断言`, 422);
         }
       }
-      record.content = text;
-      record.editedAt = this.now();
-      record.editedBy = 'manual';
       this.#saveRecord(record);
       return { ok: true, record };
     });
@@ -1042,14 +1051,6 @@ export class DailyMomentsManager {
       }
       if (record.status !== 'preview' || record.decision !== 'publish' || !record.content?.trim()) {
         throw momentError('MOMENT_NOT_DRAFT', '这不是可发布的草稿，请重新生成');
-      }
-      // 发布前再判一次事实边界：旧实现只在编辑入口校验，内存被绕过（或手改记录）后
-      // 违规正文仍能直接发出去（2026-10-24 审查 P1）。
-      if (record.contentSource === 'self') {
-        const fabricated = fabricationReason(record.content);
-        if (fabricated) {
-          throw momentError('MOMENT_DECISION_INVALID', `这份草稿${fabricated}，self 模式不发现实行动断言；请编辑后再发布`, 422);
-        }
       }
       record.publicationSource = 'manual';
       this.controller = new AbortController();
@@ -1246,7 +1247,10 @@ export class DailyMomentsManager {
           name: cleanText(member.name || '群友', 60),
           // 与记忆读侧同一口径：perChat / hidePrivateInGroup 下，私聊来源的印象不能因为
           // 「这个人也在本群说过话」就被写进公开说说（2026-10-19 全项目审查 P2）。
-          impressions: visibleImpressions(member.impressions, group.chatKey)
+          impressions: visibleImpressions(member.impressions, group.chatKey, undefined, {
+            subjectUserId: member.userId,
+            participantUserIds: group.messages.filter((message) => !message.self).map((message) => message.senderId)
+          })
             .slice(-3).map((item) => cleanText(item.content, 220))
         })),
         // 交接文本是模型从群消息整理出来的（很可能原样搬了群友的话），而它是**另一条**注入路径：

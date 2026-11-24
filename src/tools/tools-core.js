@@ -6,7 +6,7 @@
 import crypto from 'node:crypto';
 import { getConfig, imageGenAvailable, imageGenMaxPerHour } from '../core/config.js';
 import { imageType } from '../core/image-type.js';
-import { nextAtFromHHMM, normalizeRepeat, nextOccurrenceAt } from '../core/reminders.js';
+import { parseReminderDate, parseReminderTime, checkRepeatMatch, formatReminderAt, nextOccurrenceAt, normalizeRepeat, MAX_DELAY_DAYS, MAX_DELAY_MS } from '../core/reminders.js';
 import { synthesizeSpeech, ttsConfigured } from '../llm/tts.js';
 import { generateImage, MAX_PROMPT_CHARS } from '../llm/image-gen.js';
 import { resolveApiKey } from '../llm/llm.js';
@@ -428,6 +428,15 @@ function hasParticipant(ctx, userId) {
     .some((member) => String(member.userId) === String(userId));
 }
 
+function memoryParticipantIds(ctx) {
+  const privateId = String(ctx.chatKey || '').startsWith('private:') ? String(ctx.chatKey).slice(8) : '';
+  return [...new Set([
+    ...(ctx.store?.activeMembers?.(ctx.chatKey, 1000) || []).map((member) => member.userId),
+    ...(ctx.triggerEntries || []).filter((entry) => !entry.self).map((entry) => entry.senderId),
+    privateId
+  ].map((id) => String(id ?? '').trim()).filter(Boolean))];
+}
+
 function messageTargetError(ctx, { replyToMessageId, atUserId }) {
   const reply = normalizeMid(replyToMessageId);
   const at = normalizeMid(atUserId);
@@ -508,12 +517,12 @@ function getMessageImagesDescription() {
 function memoryQueryDescription() {
   const vis = memoryVisibilityOf(getConfig());
   if (vis.mode === 'perChat') {
-    return '查看你对群友的长期印象（仅当前会话：只含在当前群/私聊里观察到的印象）。不传 userId 返回全部；传 userId 只看某一个人。印象是隐私：不得向群友转述他人的印象、来源或原话。';
+    return '查看你对群友的长期印象（当前会话会在每条印象的四级范围基础上再限制为来源含当前会话）。不传 userId 返回全部；传 userId 只看某一个人。印象是隐私：不得向群友转述他人的印象、来源或原话。';
   }
   if (vis.hidePrivateInGroup) {
-    return '查看你对群友的长期印象（全局共享：汇总自所有群聊与私聊的观察；群聊里不展示私聊来源的印象）。不传 userId 返回全部；传 userId 只看某一个人。印象是跨会话的隐私：不得向群友转述他人的印象、来源或原话。';
+    return '查看你对群友的长期印象（每条印象按全局/仅相关人物/仅私聊/仅来源会话过滤；群聊里额外不展示私聊来源）。不传 userId 返回全部；传 userId 只看某一个人。印象是跨会话的隐私：不得向群友转述他人的印象、来源或原话。';
   }
-  return '查看你对群友的长期印象（全局共享：不分当前会话，汇总自所有群聊与私聊的观察）。不传 userId 返回全部；传 userId 只看某一个人。印象是跨会话的隐私：不得向群友转述他人的印象、来源或原话。';
+  return '查看你对群友的长期印象（每条印象按四级范围过滤：全局、仅相关人物、仅私聊、仅来源会话）。不传 userId 返回全部；传 userId 只看某一个人。印象是跨会话的隐私：不得向群友转述他人的印象、来源或原话。';
 }
 
 export function buildToolDefs() {
@@ -2120,31 +2129,20 @@ export function buildToolDefs() {
     },
     {
       name: 'remind',
-      description: '给当前会话设一个定时提醒（到点你会被唤醒，用你的口吻把这件事说出来）；也可查询/取消。minutes 或 HH:MM 二选一，HH:MM 按北京时间、已过则算明天。这是给别人设的提醒（重启后依然有效），与给自己排开口时机的 schedule_wake 不同。要重复提醒（每天几点、每周几几点）就传 repeat 对象，到点自动续；只想要一次就别传。'
+      description: '给当前会话设一个定时提醒（到点你会被唤醒，用你的口吻把这件事说出来）；也可查询/取消。'
+        + `可以指定一个月内的任意时刻：date="2026-11-09"（或"11月9日"）+ at="10:00"，或 at 直接写"2026-11-09 10:00"；只写 at="10:00" 表示下一个该钟点（已过算明天，最多 24 小时内）；也可以用 minutes 表示"多少分钟后"。时间一律按北京时间。`
+        + '这是给别人设的提醒（重启后依然有效），与给自己排开口时机的 schedule_wake 不同。要重复提醒（每天几点、工作日几点）就传 repeat（"daily" / "weekly:mon" / 5 字段 cron），到点自动续；只想要一次就别传。'
         + '是「A 让你提醒 B」时（如"12 点提醒他吃饭"），把 to 填成被提醒的人、from 填成提要求的人 —— 到点你才能说清是谁请你提醒谁，别让被提醒的人以为是自己设的。from 要能在最近这轮消息里对上人（填他的群名片/备注名或 QQ 号；对不上就不会记录）。',
       parameters: {
         type: 'object',
         properties: {
           action: { type: 'string', enum: ['add', 'list', 'cancel'], description: 'add=新增；list=查看本会话待触发；cancel=取消（不传 id 取消最近一条）' },
-          minutes: { type: 'number', description: 'add 用：多少分钟后（1~43200）。与 at 二选一；传了 repeat 且两者都没传时，首次触发按 repeat 规则算' },
-          at: { type: 'string', description: 'add 用：绝对时间 HH:MM（北京时间，已过则算明天）' },
+          date: { type: 'string', description: 'add 用：哪一天（北京时间）——"2026-11-09" / "11-09" / "11月9日"（不带年按今年）；和 at 的 HH:MM 搭配，最多一个月内' },
+          at: { type: 'string', description: 'add 用：几点或哪天几点——"HH:MM"（下一个该钟点，已过算明天）/"2026-11-09 10:00"（最多一个月内）' },
+          minutes: { type: 'number', description: 'add 用：多少分钟后（1~43200）；与 at/date 二选一，不能同时给' },
           text: { type: 'string', description: 'add 用：提醒内容（必填，≤200 字）' },
           to: { type: 'string', description: 'add 用：提醒谁（群名片/备注/名字；可选）' },
           from: { type: 'string', description: 'add 用：谁请你提醒的（填本轮消息里那位群友的称呼或 QQ 号；对不上人就不会记录）' },
-          repeat: {
-            type: 'object',
-            description: 'add 用：周期提醒。传对象，例如每天 21:00 = {"kind":"daily","hour":21,"minute":0}；每周五 18:30 = {"kind":"weekly","weekday":5,"hour":18,"minute":30}；cron = {"kind":"cron","cron":"30 18 * * 5"}。可选 tz（IANA，如 Asia/Shanghai）与 jitterMs（0~3600000，随机错开）。不传=一次性',
-            properties: {
-              kind: { type: 'string', enum: ['daily', 'weekly', 'cron'] },
-              hour: { type: 'integer', minimum: 0, maximum: 23 },
-              minute: { type: 'integer', minimum: 0, maximum: 59 },
-              weekday: { type: 'integer', minimum: 0, maximum: 6, description: '0=周日 … 6=周六（kind=weekly 时必填）' },
-              cron: { type: 'string', description: 'kind=cron 时必填：5 字段（分 时 日 月 周），日/月只认 *' },
-              tz: { type: 'string', description: 'IANA 时区，如 Asia/Shanghai；默认项目时区' },
-              jitterMs: { type: 'integer', minimum: 0, maximum: 3600000, description: '随机抖动上限（毫秒）' }
-            },
-            required: ['kind']
-          },
           id: { type: 'string', description: 'cancel 用：提醒 id（list 里可见）' }
         },
         required: ['action']
@@ -2155,9 +2153,9 @@ export function buildToolDefs() {
         // 控制台开关（设置 → 定时提醒）：关掉后不再接受新的提醒，已有数据保留
         if (getConfig().reminders?.enabled === false) return err('定时提醒未启用（管理员可在控制台打开）');
         const action = String(args.action || '');
-        // 提醒的绝对时间按项目统一口径（Asia/Shanghai）格式化：服务器时区不同时，
-        // "明天 09:30" 会被格式化成另一个钟点误导模型（2026-09-29 审查 P2）
-        const fmt = (ts) => new Date(ts).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+        // 提醒落点统一走 reminders.formatReminderAt（北京时间 + 星期）：服务器时区不同也不会
+        // 变成别的钟点；带星期是为了不让模型/用户把 11/08 看成 11/09（2026-11-07 线上事故）
+        const fmt = formatReminderAt;
         if (action === 'list') {
           const items = store.list(ctx.chatKey);
           if (!items.length) return ok({ pending: 0, hint: '本会话没有待触发的提醒' });
@@ -2175,35 +2173,75 @@ export function buildToolDefs() {
           if (!hit) return err('没找到对应的待触发提醒（可用 list 查看 id）');
           return ok({ canceled: true, text: hit.text, at: fmt(hit.at) });
         }
+        // 时间参数：at / date+at / minutes / 只有 repeat，四条路径，别让它们互相静默覆盖
+        // （旧实现 at 与 minutes 同时给时 minutes 被悄悄丢掉，模型以为钉住了日期，实际没有）
+        const hasAt = args.at !== undefined && args.at !== null && String(args.at).trim() !== '';
+        const hasDate = args.date !== undefined && args.date !== null && String(args.date).trim() !== '';
+        const hasMinutes = args.minutes !== undefined && args.minutes !== null && String(args.minutes).trim() !== '';
+        const repeatText = String(args.repeat ?? '').trim();
+        if (hasMinutes && (hasAt || hasDate)) {
+          return err('minutes 和 at/date 只能二选一：要"多少分钟后"就给 minutes，要"哪天几点"就给 date + at');
+        }
+        if (hasDate && hasAt && parseReminderDate(String(args.at))) {
+          return err('date 和 at 里都带了日期，给一个就行（date="2026-11-09" + at="10:00"，或 at="2026-11-09 10:00"）');
+        }
         let at = null;
-        // repeat 可能是对象（schema 声明的形式）或字符串（"daily"/"weekly:mon"/cron）。
-        // 旧写法 String(object) 会得到 "[object Object]"，带时刻的周期提醒根本建不出来。
-        const repeatArg = typeof args.repeat === 'string' ? args.repeat.trim() : args.repeat;
-        const hasRepeat = repeatArg !== undefined && repeatArg !== null
-          && !(typeof repeatArg === 'string' && repeatArg === '');
-        const quietCfg = getConfig().reminders?.quiet || null;
-        if (hasRepeat) {
-          // 周期提醒：at/minutes 只定首次触发点；都不传时按 repeat 规则算第一次
-          if (args.at !== undefined && String(args.at).trim() !== '') {
-            at = nextAtFromHHMM(String(args.at));
-            if (at === null) return err('at 需要是 HH:MM（24 小时制，如 09:30）');
-          } else if (args.minutes !== undefined && String(args.minutes).trim() !== '') {
-            const m = Number(args.minutes);
-            if (!Number.isFinite(m) || m < 1 || m > 30 * 24 * 60) return err('minutes 需要是 1~43200 之间的数字（最多 30 天）');
-            at = Date.now() + Math.round(m) * 60000;
-          } else {
-            let normalized = null;
-            try { normalized = normalizeRepeat(repeatArg); } catch (error) { return err(String(error?.message ?? error)); }
-            at = normalized ? nextOccurrenceAt({ repeat: normalized }, Date.now(), { quiet: quietCfg }) : null;
-            if (!at) return err('repeat 不合法，算不出首次触发时间');
+        let explicitDate = false;
+        let hour = null;
+        let minute = null;
+        if (hasAt || hasDate) {
+          const parsed = parseReminderTime(hasAt ? args.at : '', { date: hasDate ? args.date : '' });
+          if (!parsed) {
+            return err('时间看不懂：at 写 "HH:MM" 或 "YYYY-MM-DD HH:MM"；也可以 date 写 "2026-11-09"（或"11月9日"）+ at 写 "10:00"；最多一个月内');
           }
-        } else if (args.at !== undefined && String(args.at).trim() !== '') {
-          at = nextAtFromHHMM(String(args.at));
-          if (at === null) return err('at 需要是 HH:MM（24 小时制，如 09:30）');
-        } else {
+          at = parsed.at;
+          explicitDate = parsed.explicitDate;
+          hour = parsed.hour;
+          minute = parsed.minute;
+        } else if (hasMinutes) {
           const m = Number(args.minutes);
           if (!Number.isFinite(m) || m < 1 || m > 30 * 24 * 60) return err('minutes 需要是 1~43200 之间的数字（最多 30 天）');
           at = Date.now() + Math.round(m) * 60000;
+        } else if (!repeatText) {
+          return err('要给时间：date + at（"2026-11-09" + "10:00"）、at（"HH:MM" 或 "YYYY-MM-DD HH:MM"）、minutes（多少分钟后），或 repeat（按周期规则算下一次）');
+        }
+        let repeatObj = null;
+        if (repeatText) {
+          try {
+            repeatObj = normalizeRepeat(repeatText);
+          } catch (error) {
+            return err(String(error?.message ?? error));
+          }
+        }
+        if (repeatObj) {
+          if (explicitDate) {
+            // 显式日期 + repeat：两边必须自洽；时间以显式日期为准，周期沿用同一钟点
+            if (repeatObj.kind !== 'cron') repeatObj = { ...repeatObj, hour, minute };
+            const mismatch = checkRepeatMatch(repeatObj, at);
+            if (mismatch) return err(mismatch);
+          } else if (hour !== null && minute !== null) {
+            // 只给了钟点：首次触发点按 repeat 规则对齐到"下一个"，
+            // 不能再落到"最近的 HH:MM"（weekly:mon + 10:00 曾在周五先响一次）
+            const first = nextOccurrenceAt({ repeat: { ...repeatObj, hour, minute } }, Date.now(), {
+              quiet: getConfig().reminders?.quiet || null
+            });
+            if (first === null) return err('repeat 算不出下一次触发点，检查 repeat 写法（daily / weekly:周几 / 5 字段 cron）');
+            at = first;
+          } else {
+            // 只给了 repeat：首次触发点也按周期规则算（cron 常见用法：repeat="0 10 * * 1"）
+            const first = nextOccurrenceAt({ repeat: repeatObj }, Date.now(), {
+              quiet: getConfig().reminders?.quiet || null
+            });
+            if (first === null) return err('repeat 算不出下一次触发点，检查 repeat 写法（daily / weekly:周几 / 5 字段 cron）');
+            at = first;
+          }
+        }
+        const now = Date.now();
+        if (at <= now + 5000) {
+          return err(`这个时间已经过去了（现在是 ${formatReminderAt(now)}），说要来的时间；跨年请把年份写全`);
+        }
+        if (at - now > MAX_DELAY_MS) {
+          return err(`最多只能设到 ${MAX_DELAY_DAYS} 天后（约一个月）`);
         }
         try {
           // 归属（谁提的/提醒谁）：from 必须能在**本轮触发消息**里对上人（QQ 号、群名片或
@@ -2228,11 +2266,12 @@ export function buildToolDefs() {
             text: String(args.text ?? ''),
             createdBy,
             targetName: String(args.to ?? ''),
-            repeat: hasRepeat ? repeatArg : null,
-            quiet: quietCfg
+            repeat: repeatObj,
+            quiet: getConfig().reminders?.quiet || null
           });
           return ok({
             created: true, id, at: fmt(at),
+            ...(repeatObj ? { repeat: repeatObj.kind } : {}),
             ...(createdBy ? { from: createdBy } : {}),
             note: '到点你会被唤醒并知道该提醒什么；不需要再回复这条结果。'
               + (fromArg && !fromOk
@@ -2479,7 +2518,7 @@ export function buildToolDefs() {
         }
       },
       async execute(ctx, args) {
-        const mem = ctx.memory.query(ctx.chatKey);
+        const mem = ctx.memory.query(ctx.chatKey, '', { participantUserIds: memoryParticipantIds(ctx) });
         const userId = String(args.userId ?? '').trim();
         // 条数上限：自动注入那条路径本来就有（每人 3 条 / 整块 6000 字符），工具口却整个丢了约束 ——
         // 200 个人的记忆一次就能吃掉大半轮 maxRunTokens，下一轮预算检查直接把本轮掐断，

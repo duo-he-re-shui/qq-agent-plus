@@ -751,12 +751,21 @@ function renderMemorySettingsSection(c) {
         <input type="number" id="cfg-mem-discover-max" min="1" max="20" value="${esc(mem.discoverMaxMembers ?? 3)}" /></div>
     </div>
     <div class="hint">整理（含自动整理与「整理本群记忆」）时，把"最近 2000 条里发言达到这个条数、且还没有任何印象"的群友挑出来，读他的发言提炼新印象（单次最多挑上面那个人数）。<b>门槛越高，新人越难进入记忆</b>：高于群里多数人的发言量时，这些人可能永远不会有印象。模型自己很少主动记，这里是主要入口。默认 20 条 / 3 人。</div>
-    <div class="field"><label>记忆可见性</label>
+    <div class="field"><label for="cfg-mem-default-visibility">新记忆默认范围</label>
+      <select id="cfg-mem-default-visibility">
+        <option value="global" ${!['person', 'private', 'local'].includes(vis.default) ? 'selected' : ''}>全局：所有群聊和私聊可用</option>
+        <option value="person" ${vis.default === 'person' ? 'selected' : ''}>仅相关人物：此人的私聊 / 此人参与的群聊</option>
+        <option value="private" ${vis.default === 'private' ? 'selected' : ''}>仅私聊：不进入群聊</option>
+        <option value="local" ${vis.default === 'local' ? 'selected' : ''}>仅来源会话：只在原来的群或私聊可用</option>
+      </select>
+      <div class="hint">用于新建或新提炼的长期印象；不会批量更改旧记忆。已有印象可到「人物记忆」页逐条调整范围。共享的是长期印象，会话交接和聊天原文仍按会话隔离。</div>
+    </div>
+    <div class="field"><label>额外会话限制（兼容旧设置）</label>
       <select id="cfg-mem-visibility">
-        <option value="global" ${vis.mode === 'global' ? 'selected' : ''}>全局（默认）：所有会话的印象都注入</option>
+        <option value="global" ${vis.mode !== 'perChat' ? 'selected' : ''}>不额外限制：按每条印象的四级范围使用</option>
         <option value="perChat" ${vis.mode === 'perChat' ? 'selected' : ''}>仅本会话：只注入来源含当前会话的印象</option>
       </select>
-      <div class="hint">改成「仅本会话」后，模型在群里只看得到这个群里观察到的印象；控制台人物记忆页仍可查全部（来源不交给模型）。</div>
+      <div class="hint">「仅本会话」和下方隐藏选项会进一步收紧单条范围；要跨群/私聊共享，请选择不额外限制。控制台始终可查看和管理全部印象。</div>
     </div>
     <div class="checkbox-row"><input type="checkbox" id="cfg-mem-hideprivate" ${vis.hidePrivateInGroup ? 'checked' : ''} />
       <label for="cfg-mem-hideprivate">群聊里隐藏「私聊来源」的印象</label></div>`;
@@ -769,7 +778,9 @@ function renderTimeControlSection(c) {
       enabled: false, schedule: { mode: 'deepseek-offpeak', windows: [] }, overrides: {}
     });
   }
-  state.timeControlTarget ||= '';
+  // 配置对象也随设置落盘，页面刷新/服务重启后恢复上次保存的选择。
+  state.timeControlTarget ??= /^(group|private):[1-9]\d{0,14}$/.test(c.ui?.timeControlTarget || '')
+    ? c.ui.timeControlTarget : '';
   return `
     <section class="time-control-settings">
       <h3>时间控制</h3>
@@ -777,6 +788,7 @@ function renderTimeControlSection(c) {
         <input type="checkbox" id="tc-enabled" ${state.timeControlDraft.enabled ? 'checked' : ''} />
         <label for="tc-enabled">启用时间控制</label>
       </div>
+      <div class="hint">开关对所有聊天生效。仅限制一个群时，请将全局默认设为「全天活跃」，再为该群单独设置时段。修改后点击「保存设置」，配置及当前选择会在重启后保留。</div>
       <div class="time-control-summary">
         <span>Asia/Shanghai · UTC+8</span><span id="tc-live-state"></span>
       </div>

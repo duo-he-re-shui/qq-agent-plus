@@ -3001,10 +3001,15 @@ export class Orchestrator {
     const vis = memoryVisibilityOf(cfg);
     // 只要这个人的任何一条印象在当前会话不可见（私聊来源/perChat），就跳过整理：
     // 整理模型看到的是全量印象、写回也会整份替换，混着整理会把不可见内容带进群或删掉。
-    const existing = this.memory.members(chatKey).filter((member) => {
+    const sourceMembers = this.memory.members(chatKey);
+    const existing = sourceMembers.filter((member) => {
       const impressions = Array.isArray(member.impressions) ? member.impressions : [];
-      return visibleImpressions(impressions, chatKey, vis).length === impressions.length;
+      return visibleImpressions(impressions, chatKey, vis, {
+        subjectUserId: member.userId, participantUserIds: [...stats.memberMsgCount.keys()]
+      }).length === impressions.length;
     });
+    const blockedUserIds = new Set(sourceMembers.filter((member) => !existing.includes(member))
+      .map((member) => String(member.userId || '')));
 
     // ── 选出要整理的人 ──
     const targets = [];
@@ -3014,6 +3019,10 @@ export class Orchestrator {
     // 聊了 200 条却零印象的人，可以手动让他被分析一次）
     if (only) {
       for (const uid of only) {
+        if (blockedUserIds.has(uid)) {
+          skipped.push({ userId: uid, name: notes[uid] || '', reason: '有当前会话不可见的印象，保留原记忆并跳过整理' });
+          continue;
+        }
         const found = existing.find((m) => String(m.userId || '') === uid);
         if (found) {
           const resolved = this.#resolveIdentity(chatKey, found, stats, notes);
@@ -3035,7 +3044,7 @@ export class Orchestrator {
       }
     } else {
       // 先整理记忆里已有的人
-      const knownUserIds = new Set();
+      const knownUserIds = new Set(blockedUserIds);
       // 反查之后，同一个人的两条记录（"只有名字的遗留条目" + 本人的记录）会指向同一个 QQ 号：
       // 必须并成一条再送给模型 —— 分开整理的话，后写回的那条会把前一条的并集结果覆盖掉。
       const targetByUid = new Map();
@@ -3302,6 +3311,11 @@ export class Orchestrator {
     const snapshotTexts = new Set(existing.map((e) => String(e?.content ?? '').trim()));
     const currentRow = (this.memory.members(chatKey) || [])
       .find((m) => String(m?.userId || '') === String(mem.userId || ''));
+    const currentByContent = new Map((currentRow?.impressions || []).map((entry) => [entry.content, entry]));
+    if (existing.some((entry) => (entry.visibility || 'global')
+      !== (currentByContent.get(entry.content)?.visibility || 'global'))) {
+      throw new Error('整理期间可见范围已被修改，本轮保留现值，请重新整理');
+    }
     const appendedDuring = (currentRow?.impressions || [])
       .map((e) => String(e?.content ?? '').trim())
       .filter((t) => t && !snapshotTexts.has(t));

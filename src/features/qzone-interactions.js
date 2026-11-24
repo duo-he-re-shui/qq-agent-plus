@@ -17,6 +17,7 @@ import {
   parseQzoneFeed,
   qzoneCommentKey,
   qzonePostKey,
+  qzoneImagesFromRaw,
   QzoneWebClient
 } from '../onebot/qzone-feed.js';
 import {
@@ -27,7 +28,8 @@ import {
 import { resolveToolCalls } from '../tools/inline-tools.js';
 import { minuteOfDayInZone, sanitizeUserText } from '../core/util.js';
 import { newTraceId, withTrace } from '../core/logger.js';
-import { fetchQzoneFriendSpaces } from '../onebot/qzone-friend-spaces.js';
+import { visionEnabled } from '../llm/vision-scan.js';
+import { prepareQzoneImages, qzoneImageAuditMessages, QZONE_IMAGE_TOKENS, QZONE_MAX_IMAGES } from './qzone-images.js';
 
 const STATE_FILE = path.join(DATA_DIR, 'qzone-interactions.json');
 const HOUR_MS = 60 * 60 * 1000;
@@ -42,21 +44,6 @@ function cleanText(value, max = 1000) {
   // 双保险：数据源头（qzone-feed.js 的 compact）已过 sanitizeUserText，
   // 拼进互动决策提示词前再过一次 —— 昵称等字段可能绕过 compact 直达这里。
   return sanitizeUserText(String(value ?? '').replace(/\0/g, '').replace(/[ \t]+/g, ' ').trim()).slice(0, max);
-}
-
-function feedTransportCodes(error) {
-  const codes = new Set();
-  const pending = [error];
-  // Undici puts ECONNRESET/UND_ERR_SOCKET on cause, sometimes inside an
-  // AggregateError. Keep only codes, never URLs, tokens or raw response bodies.
-  for (let i = 0; i < pending.length && i < 16; i++) {
-    const item = pending[i];
-    if (!item || typeof item !== 'object') continue;
-    if (/^[A-Z][A-Z0-9_]{1,63}$/.test(String(item.code || ''))) codes.add(item.code);
-    if (item.cause) pending.push(item.cause);
-    if (Array.isArray(item.errors)) pending.push(...item.errors.slice(0, 8));
-  }
-  return [...codes];
 }
 
 function readJson(file, fallback) {
@@ -155,8 +142,6 @@ function defaultState() {
     replyInitializedAt: 0,
     lastFeedPollAt: 0,
     lastReplyPollAt: 0,
-    friendFeedCursor: '',
-    friendFeedSeenUins: [],
     feeds: [],
     comments: [],
     watchedPosts: [],
@@ -178,8 +163,6 @@ function normalizeState(raw) {
   state.replyInitializedAt = Number(state.replyInitializedAt) || 0;
   state.lastFeedPollAt = Number(state.lastFeedPollAt) || 0;
   state.lastReplyPollAt = Number(state.lastReplyPollAt) || 0;
-  state.friendFeedCursor = String(state.friendFeedCursor || '');
-  state.friendFeedSeenUins = Array.isArray(state.friendFeedSeenUins) ? state.friendFeedSeenUins.map(String) : [];
   return state;
 }
 
@@ -273,6 +256,7 @@ function publicPost(post) {
     alreadyLiked: post.isLiked === true,
     recentComments: (post.comments || []).slice(-8).map((comment) => ({
       author: sanitizeUserText(comment.nickname) || '好友',
+      imageCount: comment.images?.length || 0,
       content: cleanText(comment.content, 300)
     }))
   };
@@ -283,12 +267,15 @@ function publicReply(item) {
     author: sanitizeUserText(item.comment.nickname) || '好友',
     time: item.comment.time || item.discoveredAt,
     content: cleanText(item.comment.content, 500),
+    imageCount: item.comment.images?.length || 0,
     post: {
       author: sanitizeUserText(item.post.nickname) || '好友',
+      imageCount: item.post.images?.length || 0,
       content: cleanText(item.post.content, 800)
     },
     thread: (item.context || []).slice(-10).map((comment) => ({
       author: sanitizeUserText(comment.nickname) || '好友',
+      imageCount: comment.images?.length || 0,
       content: cleanText(comment.content, 300),
       self: comment.self === true
     }))
@@ -349,6 +336,7 @@ export class QzoneInteractionManager {
     sessions = null,
     emit = null,
     complete = chatCompletionWithRetry,
+    downloadImage = undefined,
     qzoneWeb = null,
     setProactiveSuppressed = () => {},
     sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
@@ -361,6 +349,7 @@ export class QzoneInteractionManager {
     this.sessions = sessions;
     this.emit = typeof emit === 'function' ? emit : () => {};
     this.complete = complete;
+    this.downloadImage = downloadImage;
     this.qzoneWeb = qzoneWeb || new QzoneWebClient(onebot);
     this.setProactiveSuppressed = setProactiveSuppressed;
     this.sleep = sleep;
@@ -607,6 +596,7 @@ export class QzoneInteractionManager {
       tid: String(post.tid),
       nickname: cleanText(post.nickname || existing?.nickname, 80),
       content: cleanText(post.content || existing?.content, 1200),
+      images: post.images || existing?.images || [],
       time: Number(post.time || existing?.time) || 0,
       commentCount: suppliedCommentCount == null
         ? (Number(existing?.commentCount) || 0)
@@ -631,8 +621,9 @@ export class QzoneInteractionManager {
       const eligible = (!comment.parentTid && String(post.uin) === selfId) || directedToSelf;
       if (!eligible) continue;
       const key = qzoneCommentKey(post, comment);
-      if (this.state.comments.some((item) => item.key === key)) continue;
-      this.state.comments.push({
+      const existing = this.state.comments.find((item) => item.key === key);
+      if (existing && existing.status !== 'unread') continue;
+      const queued = {
         key,
         status: 'unread',
         discoveredAt: this.now(),
@@ -642,6 +633,7 @@ export class QzoneInteractionManager {
           tid: String(post.tid),
           nickname: cleanText(post.nickname, 80),
           content: cleanText(post.content, 1200),
+          images: post.images || [],
           time: Number(post.time) || 0
         },
         comment: { ...comment },
@@ -650,37 +642,20 @@ export class QzoneInteractionManager {
           ...item,
           self: String(item.uin) === selfId
         }))
-      });
+      };
+      if (existing) Object.assign(existing, queued, { discoveredAt: existing.discoveredAt });
+      else this.state.comments.push(queued);
     }
   }
 
   /** 取一页好友动态；接口失败与返回结构异常都算失败，由 #discoverFeeds 决定是否重试。 */
   async #fetchFeeds(cfg, signal) {
-    const params = { page_num: 1, count: cfg.feedFetchCount };
-    let data;
-    try {
-      data = await this.onebot.call('get_qzone_feeds', params, 30000, signal);
-    } catch (error) {
-      signal?.throwIfAborted();
-      const codes = feedTransportCodes(error);
-      const transportFailure = error?.message === 'fetch failed'
-        || error?.name === 'TimeoutError'
-        || codes.some((code) => /^(ECONNRESET|ECONNREFUSED|EPIPE|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|UND_ERR_)/.test(code));
-      if (!transportFailure || error?.outcome === 'failed') throw error;
-      const detail = `OneBot get_qzone_feeds HTTP 连接失败${codes.length ? ` (${codes.join(', ')})` : ''}`;
-      if (!this.onebot.connected || typeof this.onebot.callViaWs !== 'function') {
-        throw new Error(`${detail}；WebSocket 不可用，请检查 OneBot HTTP 地址和协议端网络`, { cause: error });
-      }
-      // This is a read-only API. Reuse the authenticated event connection when
-      // the HTTP connection is dropped; never apply this retry to Qzone writes.
-      console.log(`[qzone-interactions] ${detail}，改用 WebSocket 读取`);
-      try {
-        data = await this.onebot.callViaWs('get_qzone_feeds', params, 30000, signal);
-      } catch (wsError) {
-        signal?.throwIfAborted();
-        throw new Error(`${detail}；WebSocket 读取失败: ${cleanText(wsError?.message ?? wsError, 200)}`, { cause: wsError });
-      }
-    }
+    const data = await this.onebot.call(
+      'get_qzone_feeds',
+      { page_num: 1, count: cfg.feedFetchCount },
+      30000,
+      signal
+    );
     if (!Array.isArray(data?.feeds)) throw new Error('好友动态接口返回格式无效');
     return data;
   }
@@ -698,9 +673,8 @@ export class QzoneInteractionManager {
     ]);
   }
 
-  async #discoverFeeds(cfg, signal, run, includeExisting) {
+  async #discoverFeeds(cfg, signal) {
     let data;
-    let primaryError;
     try {
       data = await this.#fetchFeeds(cfg, signal);
     } catch (error) {
@@ -711,92 +685,27 @@ export class QzoneInteractionManager {
       );
       await this.#waitBeforeFeedRetry(signal);
       signal?.throwIfAborted();
-      try {
-        data = await this.#fetchFeeds(cfg, signal);
-      } catch (retryError) {
-        signal?.throwIfAborted();
-        primaryError = retryError;
-      }
+      data = await this.#fetchFeeds(cfg, signal);
     }
-    let baselineUins = new Set();
-    const homeFeeds = data?.feeds || [];
-    const selfId = String(this.onebot.selfId || '');
-    const onlySelf = Boolean(selfId) && homeFeeds.length > 0
-      && homeFeeds.every((feed) => String(feed?.uin || '') === selfId);
-    if (primaryError || !homeFeeds.length || onlySelf) {
-      if (run) {
-        run.feedSource = 'friend-spaces';
-        run.feedPrimaryError = primaryError ? cleanText(primaryError?.message ?? primaryError, 500)
-          : (onlySelf ? '首页只有自己的动态' : '首页动态列表为空');
-      }
-      try {
-        const fallback = await fetchQzoneFriendSpaces(this.onebot, {
-          signal, count: cfg.feedFetchCount, cursor: this.state.friendFeedCursor, sleep: this.sleep
-        });
-        this.state.friendFeedCursor = fallback.cursor;
-        if (run) run.friendSpaceFetchStats = fallback.stats;
-        if (fallback.stats.attempted && !fallback.stats.succeeded) {
-          throw new Error(`个人空间兜底全部失败: ${cleanText(fallback.lastError?.message || '请求失败', 200)}`);
-        }
-        if (primaryError && !fallback.stats.succeeded) throw primaryError;
-        const seen = new Set(this.state.friendFeedSeenUins);
-        if (run?.source === 'scheduled' && !includeExisting) {
-          baselineUins = new Set(fallback.successfulUins.filter((uin) => !seen.has(uin)));
-        }
-        for (const uin of fallback.successfulUins) seen.add(uin);
-        this.state.friendFeedSeenUins = [...seen].slice(-10000);
-        data = { ...fallback, feeds: [...homeFeeds, ...fallback.feeds] };
-        console.log(`[qzone-interactions] 个人空间兜底: 查询=${fallback.stats.attempted} 成功=${fallback.stats.succeeded} 失败=${fallback.stats.failed} 总好友=${fallback.stats.totalFriends}`);
-      } catch (error) {
-        signal?.throwIfAborted();
-        throw new Error(primaryError
-          ? `${cleanText(primaryError?.message ?? primaryError, 300) || '好友动态接口调用失败（无错误信息）'}；${cleanText(error?.message ?? error, 200)}`
-          : cleanText(error?.message ?? error, 500), { cause: error });
-      }
-    } else if (run) run.feedSource = 'home';
     const cutoff = Math.floor((this.now() - cfg.maxAgeHours * HOUR_MS) / 1000);
     let discovered = 0;
-    const stats = { fetched: data.feeds.length, unsupported: 0, invalid: 0, expired: 0, self: 0, existing: 0, emptyContent: 0 };
-    if (run) run.feedFetchStats = stats;
     for (const raw of data.feeds) {
       const post = parseQzoneFeed(raw);
-      if (post.appid !== 311) { stats.unsupported += 1; continue; }
-      if (!post.tid || !post.uin || !Number.isFinite(post.time) || post.time <= 0) { stats.invalid += 1; continue; }
-      if (post.time < cutoff) { stats.expired += 1; continue; }
-      if (!post.content && !post.images.length) stats.emptyContent += 1;
-      // Older versions used the list key as the post tid. Keep reviewed/unknown
-      // states when HTML metadata (or a newer server) supplies the real tid.
-      const key = qzonePostKey(post);
-      const legacyKey = `${post.uin}:${raw.key || ''}`;
-      if (raw.key && legacyKey !== key) {
-        for (const item of this.state.feeds.filter((item) => item.key === legacyKey)) {
-          item.key = key;
-          item.post = post;
-        }
-        for (const watch of this.state.watchedPosts.filter((item) => item.key === legacyKey)) {
-          watch.key = key;
-          watch.tid = post.tid;
-        }
-        for (const item of this.state.comments.filter((item) => qzonePostKey(item.post) === legacyKey)) {
-          item.post.tid = post.tid;
-          item.key = qzoneCommentKey(item.post, item.comment);
-        }
-      }
+      if (post.appid !== 311 || !post.tid || !post.uin || post.time < cutoff) continue;
       if (post.uin === String(this.onebot.selfId || '')) {
-        stats.self += 1;
         this.#watchPost(post);
         this.#queueComments(post);
         continue;
       }
+      const key = qzonePostKey(post);
       const existing = this.state.feeds.find((item) => item.key === key);
       if (existing) {
-        stats.existing += 1;
         existing.post = post;
         existing.updatedAt = this.now();
       } else {
         this.state.feeds.push({
           key,
-          status: baselineUins.has(post.uin) ? 'baseline' : 'unread',
+          status: 'unread',
           discoveredAt: this.now(),
           updatedAt: this.now(),
           post
@@ -805,7 +714,6 @@ export class QzoneInteractionManager {
       }
       if (this.state.watchedPosts.some((item) => item.key === key)) this.#queueComments(post);
     }
-    console.log(`[qzone-interactions] 好友动态读取: 返回=${stats.fetched} 新增=${discovered} 已有=${stats.existing} 自己=${stats.self} 过期=${stats.expired} 非说说=${stats.unsupported} 字段无效=${stats.invalid} 正文及图片为空=${stats.emptyContent}`);
     this.state.lastFeedPollAt = this.now();
     return discovered;
   }
@@ -833,6 +741,7 @@ export class QzoneInteractionManager {
           tid: String(item.tid || ''),
           nickname: resolveSelfName(getConfig().persona || {}, this.onebot.selfNickname || ''),
           content: cleanText(item.content, 1200),
+          images: qzoneImagesFromRaw(item),
           time: Number(item.time) || 0,
           commentCount: Number(item.comment_num) || 0
         };
@@ -914,13 +823,20 @@ export class QzoneInteractionManager {
       Math.max(20000, cappedByTokenSaver(Number(root.api?.maxRunTokens) || 160000, tokenSaverCapsOf(root)?.maxRunTokens))
     );
     const budget = Math.max(4000, hardLimit - 8192);
+    const hasImages = candidates.some(({ item }) => item.post?.images?.length
+      || item.comment?.images?.length || (item.context || item.post?.comments || []).some((c) => c.images?.length));
+    const imageBudget = hasImages && visionEnabled()
+      ? Math.min(QZONE_MAX_IMAGES, Math.floor(budget / 2 / QZONE_IMAGE_TOKENS)) * QZONE_IMAGE_TOKENS : 0;
     const selected = [];
-    let estimatedTokens = estimateQzoneTokens(systemPrompt) + estimateQzoneTokens(tools) + 500;
+    let estimatedTokens = estimateQzoneTokens(systemPrompt) + estimateQzoneTokens(tools) + 1500 + imageBudget;
     for (const candidate of candidates) {
       const publicItem = candidate.type === 'feed'
         ? publicPost(candidate.item.post)
         : publicReply(candidate.item);
-      const cost = estimateQzoneTokens(publicItem) + 80;
+      const imageReferences = (publicItem.imageCount || 0) + (publicItem.post?.imageCount || 0)
+        + (publicItem.thread || publicItem.recentComments || []).reduce((n, c) => n + c.imageCount, 0);
+      // Reserve the status objects and ownership labels too, even for omitted/duplicate images.
+      const cost = estimateQzoneTokens(publicItem) + 80 + imageReferences * 80;
       if (estimatedTokens + cost > budget) break;
       selected.push({ ...candidate, publicItem });
       estimatedTokens += cost;
@@ -933,6 +849,7 @@ export class QzoneInteractionManager {
       deferredFeeds: feeds.length - selected.filter((item) => item.type === 'feed').length,
       deferredReplies: replies.length - selected.filter((item) => item.type === 'reply').length,
       estimatedTokens,
+      imageBudget,
       budget
     };
   }
@@ -987,6 +904,9 @@ export class QzoneInteractionManager {
     const systemPrompt = buildQzoneInteractionPrompt(root.persona, { accountNickname: this.onebot?.selfNickname || '' });
     const defs = [this.#submitToolDef(batch.feeds, batch.replies, cfg)];
     const tools = openAiTools(defs);
+    const images = await prepareQzoneImages(batch, {
+      enabled: visionEnabled(), signal, download: this.downloadImage, tokenBudget: batch.imageBudget
+    });
     const userPrompt = [
       '以下条目是本轮能够放入上下文的全部未阅览项目，已按优先级和时间从新到旧排列。',
       `本轮最多点赞 ${cfg.maxLikesPerRun} 条、评论 ${cfg.maxCommentsPerRun} 条、回复 ${cfg.maxRepliesPerRun} 条。`,
@@ -997,7 +917,8 @@ export class QzoneInteractionManager {
     ].join('\n\n');
     const messages = [
       { role: 'system', content: systemPrompt },
-      { role: 'user', content: userPrompt }
+      { role: 'user', content: userPrompt },
+      ...(images.parts.length ? [{ role: 'user', content: images.parts }] : [])
     ];
     const usage = emptyUsage();
     let finalPlan = null;
@@ -1015,7 +936,7 @@ export class QzoneInteractionManager {
       assertTimeAllowed('');
       if (session) {
         session.inputRound = round + 1;
-        session.inputMessages = structuredClone(messages);
+        session.inputMessages = qzoneImageAuditMessages(messages);
         session.inputPayloadChars = JSON.stringify({ messages, tools }).length;
         session.activity = '正在阅览空间动态…';
         this.sessions.update(session.id);
@@ -1117,7 +1038,7 @@ export class QzoneInteractionManager {
       '模型未在轮次预算内提交有效互动决定',
       422
     );
-    return { plan: finalPlan, usage, model: session?.model || root.api?.model || '' };
+    return { plan: finalPlan, usage, model: session?.model || root.api?.model || '', images: images.summary };
   }
 
   #findRoot(item) {
@@ -1380,7 +1301,7 @@ export class QzoneInteractionManager {
       let feedOk = false;
       if (kind === 'all' || kind === 'feed') {
         try {
-          run.discoveredFeeds = await this.#discoverFeeds(cfg, this.controller.signal, run, includeExisting);
+          run.discoveredFeeds = await this.#discoverFeeds(cfg, this.controller.signal);
           feedOk = true;
         } catch (error) {
           // 中止（手动停止/重启/离开活跃时段）照旧结束整轮，不算接口失败
@@ -1441,6 +1362,7 @@ export class QzoneInteractionManager {
       const decided = await this.#decide(batch, cfg, session, this.controller.signal);
       run.usage = decided.usage;
       run.model = decided.model;
+      run.images = decided.images;
       run.plan = decided.plan;
       // ⚠️ 这里**不要**提前把整批标成 reviewed（2026-10-03 全量审查）：下面 #executePlan 的两个
       // 循环头会在"手动停止/窗口关闭"时 break，未执行的条目必须保持 unread 留给下个活跃窗口重试 ——

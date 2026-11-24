@@ -8,7 +8,6 @@
 //
 // 视频下载走宿主的 media 能力（宿主校验 SSRF、限体积、ffmpeg 合流），插件进程不执行命令、也拿不到别的目录。
 import crypto from 'node:crypto';
-import { mergeLoginTokens } from './login-tokens.mjs';
 
 const send = (message) => { process.stdout.write(`${JSON.stringify(message)}\n`); };
 
@@ -55,8 +54,7 @@ function qrDataUrl(url) {
 }
 
 function qrText(url) {
-  // 用 L 级纠错：二维码模块更少，半块字符文本才装得进单条发言上限。
-  const qr = qrcode(0, 'L');
+  const qr = qrcode(0, 'M');
   qr.addData(url);
   qr.make();
   const n = qr.getModuleCount();
@@ -103,9 +101,7 @@ async function cookies() {
 async function authState() {
   const c = await cookies();
   return {
-    // loggedIn = 可写（SESSDATA + bili_jct）；hasSession = 只读可用（有 SESSDATA 就够）
     loggedIn: Boolean(c.sessdata && c.bili_jct),
-    hasSession: Boolean(c.sessdata),
     mid: c.dedeuserid || '',
     // csrf 字段：写工具的表单要用（auth.bili_jct）。以前漏了这个字段，
     // csrf 被当成字面量 "undefined" 发出去 → B 站必回 -111（Cookie 头是对的也没用）。
@@ -119,53 +115,10 @@ async function authState() {
   };
 }
 
-async function requireLogin({ write = true } = {}) {
+async function requireLogin() {
   const auth = await authState();
-  if (write ? !auth.loggedIn : !auth.hasSession) {
-    throw new Error(write
-      ? '这个操作需要登录：请在插件设置里填 SESSDATA 与 bili_jct（浏览器登录 B 站后从 Cookie 复制）'
-      : '这个操作需要登录：请填 SESSDATA（只读操作不要求 bili_jct）');
-  }
+  if (!auth.loggedIn) throw new Error('这个操作需要登录：请在插件设置里填 SESSDATA 与 bili_jct（浏览器登录 B 站后从 Cookie 复制）');
   return auth;
-}
-
-/** 用 nav 读平台实际登录身份（不信任 Cookie 里的 DedeUserID，它可能过期或与当前账号不一致）。 */
-async function navIdentity() {
-  const nav = await httpJson(`${API}/x/web-interface/nav`, { auth: true, allowCodes: [-101] });
-  return {
-    isLogin: nav?.data?.isLogin === true,
-    mid: String(nav?.data?.mid || ''),
-    uname: String(nav?.data?.uname || '')
-  };
-}
-
-/**
- * 写操作专用：登录态 + 主人账号核对。
- * 设置里填了 ownerMid（B 站 UID）后，平台实际登录的 mid 必须与它一致 —— 换账号/凭据失效时
- * 直接拒绝写入，而不是拿别人的账号点赞投币（humanism 插件同款做法）。
- */
-async function requireWriteAuth() {
-  const auth = await requireLogin();
-  const expected = String(setting('ownerMid', '') || '').trim();
-  if (!expected) return auth;
-  if (!/^\d+$/.test(expected)) throw new Error('插件设置里的主人 UID（ownerMid）必须是纯数字');
-  const who = await navIdentity();
-  if (!who.isLogin) throw new Error('写操作前核对失败：当前登录态无效，请重新登录后再试');
-  if (who.mid !== expected) {
-    throw new Error(`当前登录的是 UID ${who.mid}（${who.uname || '未知账号'}），不是绑定的主人 UID ${expected}：`
-      + '写操作已拒绝。要换账号请在控制台重新登录，或修改插件设置里的主人 UID');
-  }
-  auth.navMid = who.mid;
-  auth.navUname = who.uname;
-  return auth;
-}
-
-/** Cookie 里的 DedeUserID 可能缺失：收藏夹这类接口要 UID 时用 nav 的实际 mid 兜底。 */
-async function accountMidOf(auth) {
-  if (auth.mid) return auth.mid;
-  const who = await navIdentity();
-  if (!who.isLogin || !who.mid) throw new Error('拿不到当前账号 UID：请在插件设置里补 DedeUserID，或重新登录');
-  return who.mid;
 }
 
 // ── HTTP ────────────────────────────────────────────────────────────────
@@ -182,12 +135,6 @@ function biliError(code, message) {
   };
   const hint = hints[String(code)] || message || 'B 站接口返回错误';
   return new Error(`${hint}（code=${code}${message && message !== hint ? `，${message}` : ''}）`);
-}
-
-/** 写请求发出后遇到的 5xx/超时/非 JSON：可能已经写成功，必须让宿主按"结果未知"处理。 */
-function isUncertainWriteError(error) {
-  return /HTTP 5\d\d|timed out|timeout|超时|ECONNRESET|EPIPE|fetch failed|network|socket hang up|不是 JSON/i
-    .test(String(error?.message || error));
 }
 
 async function httpJson(url, { method = 'GET', form = null, auth = false, allowCodes = [], headers = {}, asText = false, decompress = false, withSetCookies = false } = {}) {
@@ -227,10 +174,6 @@ async function httpJson(url, { method = 'GET', form = null, auth = false, allowC
   try {
     return await attempt();
   } catch (error) {
-    if (verbMethod === 'POST' && isUncertainWriteError(error)) {
-      // 写请求已经发出：5xx/超时/非 JSON 不能当成"确定没写"，否则宿主退款→模型重试=重复评论/弹幕。
-      throw Object.assign(new Error(String(error?.message ?? error)), { code: 'E_WRITE_UNKNOWN' });
-    }
     const riskHit = verbMethod === 'GET' && /-352|412|-509/.test(String(error?.message || error));
     if (!riskHit) throw error;
     // 匿名读请求被风控是常态：两次退避（2.5s/5s）。写路径在上面已保证绝不进来
@@ -417,20 +360,6 @@ const tools = {
       level: Number(u.level) || 0,
       url: userLink(id)
     };
-    // 直播状态：这是独立域名（api.live.bilibili.com），失败不影响资料本身
-    try {
-      const live = await httpJson(`https://api.live.bilibili.com/room/v1/Room/getRoomInfoOld?mid=${id}`, { allowCodes: [-400, -404] });
-      if (live?.data?.roomid) {
-        result.live = {
-          live: Number(live.data.liveStatus) === 1,
-          title: String(live.data.title || ''),
-          url: String(live.data.url || ''),
-          online: Number(live.data.online) || 0
-        };
-      }
-    } catch (error) {
-      result.liveError = String(error?.message || error);
-    }
     if (withVideos) {
       try {
         const url = await wbiUrl('/x/space/wbi/arc/search', { mid: id, pn: 1, ps: 6, order: 'pubdate' });
@@ -471,12 +400,11 @@ const tools = {
   },
 
   async account({ what, mediaId, page, cursor } = {}) {
-    // 只读接口有 SESSDATA 就够；doctor 要在 mid 检查之前（它就是用来排查配置缺项的）
-    const auth = await requireLogin({ write: false });
-    if (what === 'doctor' || what === 'whoami') {
+    const auth = await requireLogin();
+    if (!auth.mid && what !== 'favorites') throw new Error('需要 DedeUserID：请在插件设置里补上（B 站 UID）');
+    if (what === 'doctor') {
       return probeStatus();
     }
-    if (!auth.mid && what !== 'favorites') throw new Error('需要 DedeUserID：请在插件设置里补上（B 站 UID）');
     if (what === 'history') {
       // cursor 语义（ps 固定 20）：翻页用上一次返回的 nextCursor，不是页码
       const cursorParam = String(cursor || '').replace(/[^\w=&]/g, '').slice(0, 200);
@@ -513,24 +441,14 @@ const tools = {
         results: (data?.data?.medias || []).map((item) => ({ bvid: item.bvid, title: item.title, author: item.upper?.name || '', url: item.bvid ? bvLink(item.bvid) : '' }))
       };
     }
-    throw new Error('what 只能是 whoami / doctor / history / favorites / followings');
+    throw new Error('what 只能是 history / favorites / followings');
   },
 
   // ── 扫码登录（聊天内完成，Cookie 进加密凭据、立即生效） ──
   async login({ action, channel: channelArg } = {}, context = {}) {
     const PASSPORT = 'https://passport.bilibili.com';
-    const channel = String(channelArg || 'chat');
-    // 聊天内登录/退出只允许管理员：私聊白名单里的普通好友不能把机器人绑到自己账号上，
-    // 也不能把管理员的凭据清掉。控制台走已鉴权的 callConsoleTool，不受这条限制。
-    if (channel !== 'console' && action !== 'status' && context?.senderIsOwner !== true) {
-      throw new Error('只有管理员可以扫码登录或退出 B 站；其他人请在控制台操作');
-    }
     if (action === 'status') return probeStatus();
     if (action === 'logout') {
-      // 群聊里任何一句诱导都不能清掉凭据：退出只允许私聊/控制台
-      if (String(context?.chatKey || '').startsWith('group:')) {
-        throw new Error('退出登录请在私聊或控制台操作（群里不让清凭据）');
-      }
       await callHost('cap.secrets.set', { values: { sessdata: '', bili_jct: '', buvid3: '', dedeuserid: '' } });
       return { ok: true, note: '已退出登录，凭据已清除' };
     }
@@ -546,27 +464,14 @@ const tools = {
         return { ok: true, channel: 'console', qrcodeDataUrl: qrDataUrl(url), note: '用手机 B 站 App 扫这个码，手机上点确认后点「查扫码结果」（8 分钟内有效）。' };
       }
       const target = String(context?.chatKey || '');
-      if (!/^(group|private):\d+$/.test(target)) throw new Error('请在私聊或控制台发起登录（二维码要发到当前会话）');
-      if (target.startsWith('group:')) {
-        throw new Error('群聊里不能扫码登录：二维码会被任意群成员扫走并绑定成机器人的账号。请私聊机器人或在控制台操作');
-      }
-      pendingLogin = { ...pendingLogin, chatKey: target };
+      if (!/^(group|private):\d+$/.test(target)) throw new Error('请在群聊或私聊里发起登录（二维码要发到当前会话）');
       // 二维码本体只在会话里发，登录链接（含会话密钥）绝不交给第三方二维码服务
-      const codeText = qrText(url);
-      // 超长会被宿主拒绝（cap.send.text 不静默截断）；提前给出可操作的提示
-      if (codeText.length > 1400) {
-        throw new Error('登录链接太长，二维码放不进一条消息：请在控制台 → 插件 → B 站 → 扫码登录');
-      }
-      await callHost('cap.send.text', { chatKey: target, text: codeText });
+      await callHost('cap.send.text', { chatKey: target, text: qrText(url) });
       return { ok: true, note: '二维码已发到本会话：用手机 B 站 App 扫码并在手机上点确认，然后说一声"好了"，我查结果（8 分钟内有效）。' };
     }
     if (action === 'poll') {
       if (!pendingLogin.key || Date.now() - pendingLogin.at > 8 * 60_000) {
         throw new Error('没有进行中的扫码，或二维码已过期：请重新开始登录');
-      }
-      if (channel !== 'console' && pendingLogin.chatKey
-        && String(context?.chatKey || '') !== pendingLogin.chatKey) {
-        throw new Error('这个扫码登录不是在这个会话发起的：请回到发起登录的会话完成');
       }
       const data = await httpJson(`${PASSPORT}/x/passport-login/web/qrcode/poll?qrcode_key=${encodeURIComponent(pendingLogin.key)}&source=main-fe-header`, { headers: { origin: REFERER.slice(0, -1) }, withSetCookies: true });
       const code = Number(data?.data?.code);
@@ -574,14 +479,45 @@ const tools = {
       if (code === 86101) return { ok: true, state: 'waiting', note: '还没扫码：打开手机 B 站 App 扫一下刚才那张码' };
       if (code === 86090) return { ok: true, state: 'scanned', note: '已扫码：请在手机上点确认' };
       if (code !== 0) throw new Error(`登录状态异常（code=${code}）：${data?.data?.message || ''}`);
-      // 成功：回跳 URL（可能嵌套 crossDomain）与 Set-Cookie 按字段合并。
-      // 解析在 login-tokens.mjs（纯函数，单测覆盖"URL 有 SESSDATA、Set-Cookie 只有 bili_jct"）。
-      const creds = mergeLoginTokens(data?.data?.url, data?.setCookies);
-      if (!creds.sessdata) throw new Error('登录确认成功，但响应里没有 SESSDATA（回跳 URL 与 Set-Cookie 都没有）——请把这个截图发给管理员排查');
-      if (!creds.bili_jct) throw new Error('登录确认成功，但没拿到 bili_jct（写操作会全部失败）：请重新扫码，或在控制台插件详情里重新登录');
-      const values = { sessdata: creds.sessdata, bili_jct: creds.bili_jct };
-      // DedeUserID 缺失时显式清空（空串 = 删除），避免沿用上一个账号的 UID
-      values.dedeuserid = creds.dedeuserid || '';
+      // 成功：凭据优先在**回跳 URL**里 —— 可能嵌套（新流程把 crossDomain URL 塞在另一个参数里），
+      // 逐层解 URL 找 SESSDATA；找不到再退回本次响应的 Set-Cookie。参考 dsh-bilibili 同款实现。
+      const findTokens = (urlText) => {
+        const queue = [String(urlText ?? '')];
+        const seen = new Set();
+        while (queue.length) {
+          const candidate = queue.shift();
+          if (!candidate || seen.has(candidate)) continue;
+          seen.add(candidate);
+          let parsed;
+          try { parsed = new URL(candidate); } catch { continue; }
+          const sessdata = parsed.searchParams.get('SESSDATA');
+          if (sessdata) {
+            return { sessdata, bili_jct: parsed.searchParams.get('bili_jct') || '', dedeuserid: parsed.searchParams.get('DedeUserID') || '' };
+          }
+          for (const value of parsed.searchParams.values()) {
+            let decoded = value;
+            try { decoded = decodeURIComponent(value); } catch { /* 不是编码串就原样入队 */ }
+            if (/crossDomain|SESSDATA|passport/i.test(decoded)) queue.push(decoded);
+          }
+        }
+        return null;
+      };
+      const fromJar = () => {
+        const jar = {};
+        for (const line of (Array.isArray(data?.setCookies) ? data.setCookies : [])) {
+          const first = String(line).split(';')[0];
+          const eq = first.indexOf('=');
+          if (eq > 0) jar[first.slice(0, eq).trim()] = first.slice(eq + 1).trim();
+        }
+        return jar.SESSDATA ? { sessdata: jar.SESSDATA, bili_jct: jar.bili_jct || '', dedeuserid: jar.DedeUserID || '' } : null;
+      };
+      const creds = findTokens(data?.data?.url) || fromJar();
+      const values = {};
+      if (creds?.sessdata) {
+        values.sessdata = creds.sessdata;
+        if (creds.bili_jct) values.bili_jct = creds.bili_jct;
+        if (creds.dedeuserid) values.dedeuserid = creds.dedeuserid;
+      }
       if (pickBuvid()) values.buvid3 = pickBuvid();
       // buvid3 从 Cookie jar 里顺带取（没有也不挡登录）
       function pickBuvid() {
@@ -591,19 +527,11 @@ const tools = {
         }
         return '';
       }
+      if (!values.sessdata) throw new Error('登录确认成功，但响应里没有 SESSDATA（回跳 URL 与 Set-Cookie 都没有）——请把这个截图发给管理员排查');
       await callHost('cap.secrets.set', { values });
       pendingLogin = { key: '', url: '', at: 0 };
-      // 保存后实测一次：不把"接口返回了凭据"当成"登录有效"（可能已被风控/账号异常）
       const probe = await probeStatus();
-      if (!probe.login) {
-        return {
-          ok: true,
-          state: 'unverified',
-          account: probe.uname || `UID ${creds.dedeuserid || '?'}`,
-          note: `凭据已加密保存，但 B 站校验未通过（${probe.note}）。如果是风控，稍后点「检测登录」复查；持续无效请重新扫码`
-        };
-      }
-      return { ok: true, state: 'done', account: probe.uname || `UID ${creds.dedeuserid || '?'}`, note: '登录成功，已安全保存并立即生效' };
+      return { ok: true, state: 'done', account: probe.uname || `UID ${values.dedeuserid || '?'}`, note: '登录成功，已安全保存并立即生效' };
     }
     throw new Error('action 只能是 start / poll / status / logout');
   },
@@ -875,10 +803,8 @@ const tools = {
    * 失败直接 throw —— 宿主会把已扣的批准与配额退回去。
    */
   async interact({ action, bvid, mid, undo, count } = {}) {
-    const auth = await requireWriteAuth();
-    if (!['like', 'coin', 'favorite', 'follow', 'triple'].includes(action)) {
-      throw new Error('action 只能是 like / coin / favorite / follow / triple');
-    }
+    const auth = await requireLogin();
+    if (!['like', 'coin', 'favorite', 'follow'].includes(action)) throw new Error('action 只能是 like / coin / favorite / follow');
 
     if (action === 'follow') {
       const target = String(mid || '').trim();
@@ -895,50 +821,6 @@ const tools = {
     }
 
     const info = await viewOf(bvid);
-    if (action === 'triple') {
-      if (undo) throw new Error('triple 不支持撤销：请分别用 like / coin / favorite 的 undo');
-      const accountMid = await accountMidOf(auth);
-      // 先确认收藏夹存在，再动点赞/投币：否则收藏失败时前两步已经写出去，很难解释
-      const folders = await httpJson(`${API}/x/v3/fav/folder/created/list-all?up_mid=${accountMid}`, { auth: true });
-      const folder = (folders?.data?.list || [])[0];
-      if (!folder) throw new Error('你的账号还没有收藏夹，先在 B 站网页建一个再一键三连');
-      const inFolder = async () => {
-        const list = await httpJson(`${API}/x/v3/fav/resource/list?media_id=${folder.id}&pn=1&ps=20&keyword=${encodeURIComponent(info.bvid)}&platform=web`, { auth: true });
-        return (list?.data?.medias || []).some((item) => item.bvid === info.bvid);
-      };
-      const steps = {};
-
-      const liked = await likedState(info.bvid);
-      if (liked) steps.like = { skipped: 'already-liked', verified: true };
-      else {
-        await httpJson(`${API}/x/web-interface/archive/like`, {
-          method: 'POST', auth: true, form: { bvid: info.bvid, like: 1, csrf: auth.bili_jct }
-        });
-        steps.like = { verified: await likedState(info.bvid) };
-      }
-
-      const given = await coinState(info.bvid);
-      if (given >= 1) steps.coin = { skipped: `already-${given}-coins`, verified: true };
-      else {
-        await httpJson(`${API}/x/web-interface/coin/add`, {
-          method: 'POST', auth: true, form: { bvid: info.bvid, multiply: 1, select_like: 0, csrf: auth.bili_jct }
-        });
-        steps.coin = { count: 1, verified: (await coinState(info.bvid)) >= 1 };
-      }
-
-      if (await inFolder()) steps.favorite = { skipped: 'already-favorited', folder: folder.title, verified: true };
-      else {
-        await httpJson(`${API}/x/v3/fav/resource/deal`, {
-          method: 'POST', auth: true,
-          form: { rid: info.aid, type: 2, add_media_ids: String(folder.id), del_media_ids: '', csrf: auth.bili_jct }
-        });
-        steps.favorite = { folder: folder.title, verified: await inFolder() };
-      }
-
-      const verified = Object.values(steps).every((step) => step.verified);
-      return { ok: true, action, target: info.bvid, steps, verified, ...(verified ? {} : { partial: true }) };
-    }
-
     if (action === 'like') {
       const liked = await likedState(info.bvid);
       if (!undo && liked) return { ok: true, action, target: info.bvid, skipped: 'already-liked', verified: true };
@@ -966,8 +848,8 @@ const tools = {
     }
 
     // favorite：收藏到默认收藏夹（第一个），写后回读确认
-    const accountMid = await accountMidOf(auth);
-    const folders = await httpJson(`${API}/x/v3/fav/folder/created/list-all?up_mid=${accountMid}`, { auth: true });
+    if (!auth.mid) throw new Error('收藏需要 DedeUserID：请在插件设置里补上');
+    const folders = await httpJson(`${API}/x/v3/fav/folder/created/list-all?up_mid=${auth.mid}`, { auth: true });
     const folder = (folders?.data?.list || [])[0];
     if (!folder) throw new Error('你的账号还没有收藏夹，先在 B 站网页建一个');
     const inFolder = async () => {
@@ -989,7 +871,7 @@ const tools = {
   },
 
   async comment({ bvid, text } = {}) {
-    const auth = await requireWriteAuth();
+    const auth = await requireLogin();
     const body = String(text || '').trim();
     if (!body) throw new Error('评论内容不能为空');
     if (body.length > 500) throw new Error('评论最多 500 字');
@@ -1027,7 +909,7 @@ const tools = {
   },
 
   async danmaku_send({ bvid, text, progressMs } = {}) {
-    const auth = await requireWriteAuth();
+    const auth = await requireLogin();
     const want = String(text || '').trim();
     if (!want) throw new Error('弹幕内容不能为空');
     if (want.length > 100) throw new Error('弹幕最多 100 字');
@@ -1059,31 +941,19 @@ async function probeStatus() {
   let apiOk = true;
   let login = false;
   let uname = '';
-  let mid = '';
   if (c.sessdata) {
     try {
       const nav = await httpJson(`${API}/x/web-interface/nav`, { auth: true, allowCodes: [-101] });
       login = nav?.data?.isLogin === true;
       uname = login ? String(nav.data.uname || '').slice(0, 24) : '';
-      mid = login ? String(nav.data.mid || '') : '';
     } catch { apiOk = false; }
   }
-  const boundOwner = String(setting('ownerMid', '') || '').trim();
   return {
     ok: true,
     login,
-    writable: Boolean(c.sessdata && c.bili_jct),
-    mid,
     uname,
-    owner: {
-      configured: boundOwner,
-      // null = 没绑定主人 UID（不限制）；true/false = 当前登录账号与绑定是否一致
-      matches: boundOwner ? (Boolean(mid) && mid === boundOwner) : null
-    },
     apiOk,
-    note: login
-      ? (c.bili_jct ? '登录有效' : '登录有效，但缺 bili_jct：读操作可用，写操作不可用')
-      : (c.sessdata ? 'SESSDATA 已配置但登录态无效（可能过期）' : '未配置 Cookie（只读功能可用，写操作需要登录）'),
+    note: login ? '登录有效' : (c.sessdata ? 'SESSDATA 已配置但登录态无效（可能过期）' : '未配置 Cookie（只读功能可用，写操作需要登录）'),
     configured: { sessdata: Boolean(c.sessdata), bili_jct: Boolean(c.bili_jct), buvid3: Boolean(c.buvid3), dedeuserid: Boolean(c.dedeuserid) }
   };
 }

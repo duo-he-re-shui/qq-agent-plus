@@ -135,15 +135,21 @@ export class MemoryStore {
     const userId = String(extra.userId || '').trim(); const target = clean(extra.target, 60);
     if (!userId && !target) return null;
     // origin 默认 model（机器人自己记的）；控制台手动新增的传 'manual'
-    return this.people.append(chatKey, userId, target || userId, content, Date.now(), String(extra.origin || '').trim() || 'model');
+    return this.people.append(chatKey, userId, target || userId, content, Date.now(), String(extra.origin || '').trim() || 'model', 0, extra.visibility);
   }
   members(chatKey = '') { return this.people.members(chatKey); }
   getMember(chatKey, userId) { return this.people.get(userId); }
+  setImpressionVisibility(userId, content, visibility) { return this.people.setImpressionVisibility(userId, content, visibility); }
   noteInteraction(userId, opts = {}) { return this.people.noteInteraction(userId, opts); }
-  query(chatKey, category = '') {
+  query(chatKey, category = '', { participantUserIds = [] } = {}) {
     if (category && category !== 'memberImpression') return { [category]: [] };
     const memberImpression = [];
-    for (const member of this.people.members(chatKey)) for (const e of member.impressions) memberImpression.push({ userId: member.userId, target: member.name || member.userId || '某人', content: e.content, createdAt: e.createdAt, lastObservedAt: e.lastObservedAt, origin: e.origin || '', sourceChatKeys: e.sourceChatKeys });
+    const vis = memoryVisibilityOf();
+    for (const member of this.people.members()) {
+      for (const e of visibleImpressions(member.impressions, chatKey, vis, { subjectUserId: member.userId, participantUserIds })) {
+        memberImpression.push({ userId: member.userId, target: member.name || member.userId || '某人', content: e.content, createdAt: e.createdAt, lastObservedAt: e.lastObservedAt, origin: e.origin || '', visibility: e.visibility || 'global', sourceChatKeys: e.sourceChatKeys });
+      }
+    }
     memberImpression.sort((a, b) => (b.lastObservedAt || b.createdAt) - (a.lastObservedAt || a.createdAt));
     return { memberImpression };
   }
@@ -208,7 +214,10 @@ export class MemoryStore {
     const vis = memoryVisibilityOf(getConfig());
     const picked = [];
     for (const m of raw) {
-      const keep = visibleImpressions(m.impressions, chatKey, vis);
+      const keep = visibleImpressions(m.impressions, chatKey, vis, {
+        subjectUserId: m.userId,
+        participantUserIds: userIds || []
+      });
       if (keep.length) { m.impressions = keep; picked.push(m); }
     }
     if (!picked.length) return '';

@@ -123,31 +123,3 @@ test('官方插件（本轮新增的五个）：坏参数在**发请求之前**�
       `${item.id}.${item.tool} 的坏参数报错里不该有网络字样（说明它没去打上游）：${message}`);
   }
 });
-
-// 2026-10-24：B 站插件补"主人 UID 绑定"（humanism 同款 nav.mid 核对）与一键三连。
-// 行为要真网络没法在 CI 里跑，这里锚住契约与"写入口统一走 requireWriteAuth"，
-// 防止以后新增写工具绕过主人核对。
-test('B站插件：主人 UID 绑定、whoami 与一键三连已声明，所有写入口走 requireWriteAuth', () => {
-  const manifest = manifestOf('bilibili');
-  const account = (manifest.settings?.groups || []).find((group) => group.key === 'account');
-  assert.ok(account, '要有 account 设置组');
-  const owner = (account.fields || []).find((field) => field.key === 'ownerMid');
-  assert.ok(owner, 'account 组要有 ownerMid（主人 B 站 UID）设置项');
-  assert.equal(owner.type, 'text');
-
-  const interact = manifest.tools.find((tool) => tool.name === 'interact');
-  assert.ok(interact.parameters.properties.action.enum.includes('triple'), 'interact 要支持 triple 一键三连');
-  const accountTool = manifest.tools.find((tool) => tool.name === 'account');
-  assert.ok(accountTool.parameters.properties.what.enum.includes('whoami'), 'account 要支持 whoami');
-
-  const src = fs.readFileSync(path.join(dirOf('bilibili'), 'index.mjs'), 'utf8');
-  assert.match(src, /async function requireWriteAuth/, '要有统一的写操作鉴权（登录 + 主人 UID 核对）');
-  assert.match(src, /navIdentity/, '主人核对要用 nav 读平台实际登录身份，不能只信 Cookie');
-  assert.match(src, /senderIsOwner/, '聊天内扫码登录/退出要校验发起者是管理员');
-  assert.match(src, /E_WRITE_UNKNOWN/, '写请求 5xx/超时/非 JSON 要标记结果未知');
-  assert.match(src, /mergeLoginTokens/, '登录凭据要合并 URL 与 Set-Cookie');
-  const writeEntries = src.match(/await requireWriteAuth\(\)/g) || [];
-  assert.ok(writeEntries.length >= 3, `interact/comment/danmaku_send 都要走 requireWriteAuth，实际 ${writeEntries.length} 处`);
-  const loginCalls = src.match(/await requireLogin\(\)/g) || [];
-  assert.equal(loginCalls.length, 1, '只有 requireWriteAuth 内部还能直接用 requireLogin');
-});

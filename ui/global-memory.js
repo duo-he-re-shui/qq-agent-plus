@@ -10,6 +10,15 @@ import { saveMemberNote } from './pages/memory.js';
   let people = [];
   let selectedKey = '';
   let loadSeq = 0;
+  let visibilitySaves = 0;
+  const visibilityLabels = {
+    global: '全局：所有群聊和私聊',
+    person: '仅相关人物：此人的私聊 / 参与的群聊',
+    private: '仅私聊：不进入群聊',
+    local: '仅来源会话'
+  };
+  const visibilityOptions = (value) => Object.entries(visibilityLabels)
+    .map(([key, label]) => `<option value="${key}" ${key === value ? 'selected' : ''}>${esc(label)}</option>`).join('');
 
 
   const fmtTime = (ts) => {
@@ -44,6 +53,8 @@ import { saveMemberNote } from './pages/memory.js';
       .gm-memory { margin:10px 0; padding:12px; border:1px solid var(--border, rgba(128,128,128,.2)); border-radius:var(--r-input, 10px); }
       .gm-memory-content { white-space:pre-wrap; line-height:1.55; }
       .gm-memory-meta { margin-top:7px; font-size: var(--fs-sm, 12px); opacity:.65; }
+      .gm-visibility { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:8px; }
+      .gm-visibility select { min-width:0; max-width:100%; font:inherit; color:inherit; background:var(--bg-3, rgba(127,127,127,.12)); border:1px solid var(--border); border-radius:var(--r-input,10px); padding:6px 8px; }
       .gm-section { margin:16px 0; }
       .gm-section h3 { margin:0 0 8px; }
       .gm-note { padding:10px 12px; margin:0 0 12px; border-radius:var(--r-sm, 8px); background:rgba(127,127,127,.08); font-size: var(--fs-md, 13px); line-height:1.5; }
@@ -214,7 +225,7 @@ import { saveMemberNote } from './pages/memory.js';
 
   function renderDetail() {
     const box = document.getElementById('global-memory-detail');
-    if (!box) return;
+    if (!box || visibilitySaves) return;
     const person = people.find((item) => item.key === selectedKey);
     if (!person) {
       setHtmlIfChanged(box, '<div class="empty-hint">← 选择人物查看全局长期记忆</div>');
@@ -225,8 +236,10 @@ import { saveMemberNote } from './pages/memory.js';
       ? person.sourceChatKeys.map((key) => `<span class="gm-chip">${esc(key)}</span>`).join('')
       : '<span class="muted">无来源记录</span>';
     const memories = person.impressions || [];
+    const manageable = /^\d{1,15}$/.test(String(person.userId || ''))
+      && Boolean(sourceFor(person));
     const memoryHtml = memories.length
-      ? memories.map((item) => {
+      ? memories.map((item, index) => {
           const sources = (item.sourceChatKeys || [])
             .map((key) => `<span class="gm-chip">${esc(key)}</span>`).join('');
           const at = Number(item.lastObservedAt) || Number(item.createdAt) || 0;
@@ -234,11 +247,14 @@ import { saveMemberNote } from './pages/memory.js';
             <div class="gm-memory-content">${esc(item.content)}</div>
             <div class="gm-memory-meta">最近确认 ${esc(fmtTime(at))}</div>
             <div>${sources || '<span class="muted">无来源</span>'}</div>
+            <div class="gm-visibility">
+              <label for="gm-visibility-${index}">可见范围</label>
+              <select id="gm-visibility-${index}" data-gm-visibility="${index}" ${manageable ? '' : 'disabled'}>${visibilityOptions(item.visibility || 'global')}</select>
+              <span class="gm-status" data-gm-visibility-status="${index}" role="status"></span>
+            </div>
           </div>`;
         }).join('')
       : '<div class="gm-empty">这个人目前没有长期印象</div>';
-    const manageable = /^\d{1,15}$/.test(String(person.userId || ''))
-      && Boolean(sourceFor(person));
 
     // 备注编辑放在人物记忆页：memberNotes 是按 QQ 全局的人物级数据，与长期印象同一层级。
     // （会话记忆页那份"拉取群成员列表（编辑备注）"按上游设计被 CSS 隐藏，见 ui/session-memory-view.js。）
@@ -268,14 +284,37 @@ import { saveMemberNote } from './pages/memory.js';
         </div>
       </div>
       <div class="gm-note">
-        人物长期记忆按 QQ 全局统一；来源会话只用于证据追溯，不限制这条记忆在哪个群可见。<br>
-        群聊/私聊自己的 handoff 已独立到“会话记忆”页，并继续严格按 chatKey 隔离。
+        人物长期记忆按 QQ 统一保存，每条可选「全局 / 仅相关人物 / 仅私聊 / 仅来源会话」；更改下拉后立即保存。<br>
+        「仅相关人物」用于此人的私聊或此人参与的群聊；「仅私聊」可用于各私聊，若只限本人私聊请选择该私聊为来源并设为「仅来源会话」。设置页的额外限制仍然生效。聊天原文和会话交接继续按会话隔离。
       </div>
       ${noteHtml}
       <div class="gm-section"><h3>来源会话</h3><div>${sourceHtml}</div></div>
       <div class="gm-section"><h3>长期印象</h3>${memoryHtml}</div>`);
     // 同 renderList：内容没变就别重挂监听（备注保存/整理/删除点一次会变成 N 次）。
     if (!rendered) return;
+
+    box.querySelectorAll('[data-gm-visibility]').forEach((select) => {
+      select.addEventListener('change', async () => {
+        const item = memories[Number(select.dataset.gmVisibility)];
+        const scopeStatus = box.querySelector(`[data-gm-visibility-status="${select.dataset.gmVisibility}"]`);
+        select.disabled = true;
+        visibilitySaves += 1;
+        if (scopeStatus) scopeStatus.textContent = '保存中…';
+        try {
+          await api(`/api/memory-files/global/members/${person.userId}/visibility`, {
+            method: 'PUT', body: JSON.stringify({ content: item.content, visibility: select.value })
+          });
+          item.visibility = select.value;
+          if (scopeStatus) scopeStatus.textContent = '已保存';
+        } catch (error) {
+          select.value = item.visibility || 'global';
+          if (scopeStatus) scopeStatus.textContent = `保存失败：${error?.message || error}`;
+        } finally {
+          visibilitySaves -= 1;
+          select.disabled = false;
+        }
+      });
+    });
 
     const status = box.querySelector('#gm-action-status');
     const noteInput = box.querySelector('#gm-note-input');
@@ -407,6 +446,12 @@ import { saveMemberNote } from './pages/memory.js';
     if (!select || select.dataset.filled === '1') return;
     let cfg = state.config;
     if (!cfg?.allow) { try { cfg = await api('/api/config'); } catch { cfg = cfg || null; } }
+    const visibilitySelect = document.getElementById('gm-newimp-visibility');
+    if (visibilitySelect && visibilitySelect.dataset.filled !== '1') {
+      const configured = cfg?.memory?.visibility?.default;
+      visibilitySelect.value = Object.hasOwn(visibilityLabels, configured || '') ? configured : 'global';
+      visibilitySelect.dataset.filled = '1';
+    }
     const keys = [
       ...((cfg?.allow?.groups || []).map((id) => `group:${String(id)}`)),
       ...((cfg?.allow?.private || []).map((id) => `private:${String(id)}`))
@@ -461,7 +506,16 @@ import { saveMemberNote } from './pages/memory.js';
       const base = serverNow ? serverNow.impressions
         : people.find((person) => String(person.userId || '') === qq)?.impressions;
       const known = (base || []).map((entry) => String(entry?.content || '').trim()).filter(Boolean);
-      const merged = [...new Set([...known, ...lines])];
+      const visibility = document.getElementById('gm-newimp-visibility')?.value
+        || cfgNow.memory?.visibility?.default || 'global';
+      // 旧条目用字符串传回，让服务端沿用原范围；只有这次新写的才用选择的范围。
+      const merged = [...new Set(known)];
+      const seen = new Set(known);
+      for (const content of lines) {
+        if (seen.has(content)) continue;
+        merged.push({ content, visibility });
+        seen.add(content);
+      }
       const result = await api(`/api/memory-files/${chatKey.replace(':', '_')}/members/${qq}`, {
         method: 'PUT',
         body: JSON.stringify({ name: '', note, impressions: merged })

@@ -141,6 +141,7 @@ async function saveConfig({ quiet = false } = {}) {
 
   if (sec === 'time-control') {
     captureTimeControlRule();
+    patch.ui = { ...patch.ui, timeControlTarget: state.timeControlTarget || '' };
     patch.timeControl = {
       ...structuredClone(state.timeControlDraft),
       enabled: chk('#tc-enabled'),
@@ -162,6 +163,8 @@ async function saveConfig({ quiet = false } = {}) {
       discoverMaxMembers: memThreshold(val('#cfg-mem-discover-max', c.memory?.discoverMaxMembers ?? 3), c.memory?.discoverMaxMembers, 20, 3),
       // #13 记忆可见性：默认 global + 不隐藏 = 历史行为
       visibility: {
+        ...(c.memory?.visibility || {}),
+        default: val('#cfg-mem-default-visibility', c.memory?.visibility?.default || 'global'),
         mode: val('#cfg-mem-visibility', c.memory?.visibility?.mode === 'perChat' ? 'perChat' : 'global'),
         hidePrivateInGroup: chk('#cfg-mem-hideprivate', c.memory?.visibility?.hidePrivateInGroup === true)
       }

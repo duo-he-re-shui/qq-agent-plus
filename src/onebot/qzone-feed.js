@@ -76,8 +76,54 @@ function removeNativeMention(value) {
   return {
     targetUin,
     targetName: compact(targetName, 80),
-    text: compact(text.replace(/\[em\][\s\S]*?\[\/em\]/g, ''), 800)
+    text: compact(text.replace(/\[em\][\s\S]*?\[\/em\]/g, '')
+      .replace(/\[img\][\s\S]*?\[\/img\]/gi, '[图片]')
+      .replace(/<img\b[^>]*>/gi, '[图片]'), 800)
   };
+}
+
+function imageUrl(value) {
+  const text = String(value || '').trim().replace(/&amp;/g, '&');
+  try {
+    const url = new URL(text.startsWith('//') ? `https:${text}` : text);
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password
+      || text.length > 4096 || /(^|\.)qzonestyle\.(gtimg\.cn|qq\.com)$/i.test(url.hostname)) return '';
+    return url.href;
+  } catch { return ''; }
+}
+
+function htmlImageUrls(html, comment = false) {
+  const fragment = parse(String(html || ''));
+  if (comment) {
+    for (const node of fragment.querySelectorAll('.mod-comments-sub, .comments-op, .nickname, .comments-avatar, .comments-item-avatar, .ui-avatar, .avatar')) node.remove();
+  }
+  return fragment.querySelectorAll('img').map((node) => imageUrl(
+    node.getAttribute('data-src') || node.getAttribute('data-original')
+    || node.getAttribute('orgsrc') || node.getAttribute('src')
+  )).filter(Boolean);
+}
+
+/** Only explicit picture fields/markup count as images; ordinary links and avatars do not. */
+export function qzoneImagesFromRaw(raw = {}) {
+  const urls = [];
+  for (const field of ['pic', 'pics', 'piclist', 'images']) {
+    const value = raw?.[field];
+    for (const item of Array.isArray(value) ? value : (value ? [value] : [])) {
+      const candidates = typeof item === 'string' ? [item] : [
+        item?.url3, item?.url2, item?.originalUrl, item?.origin_url,
+        item?.hd_url, item?.b_url, item?.o_url, item?.url, item?.url1, item?.smallurl, item?.s_url, item?.src
+      ];
+      const url = candidates.map(imageUrl).find(Boolean);
+      if (url) urls.push(url);
+    }
+  }
+  const content = String(raw?.content || '');
+  if (/<img\b/i.test(content)) urls.push(...htmlImageUrls(content));
+  for (const match of content.matchAll(/\[img\]([^\[]+)\[\/img\]/gi)) {
+    const url = imageUrl(match[1]);
+    if (url) urls.push(url);
+  }
+  return [...new Set(urls)].slice(0, 9);
 }
 
 export function qzonePostKey(post) {
@@ -115,6 +161,7 @@ function commentFromRaw(raw, parentTid = '') {
     uin: String(raw?.uin || ''),
     nickname: compact(raw?.name || raw?.nickname || '', 80),
     content: parsed.text,
+    images: qzoneImagesFromRaw(raw),
     targetUin: parsed.targetUin,
     targetName: parsed.targetName,
     time: Number(raw?.create_time ?? raw?.createTime ?? 0) || 0
@@ -142,27 +189,16 @@ function parsedCommentContent(item) {
   return compact(fragment.textContent.replace(/^[\s:：]+/, ''), 800);
 }
 
-function feedContentText(node) {
-  if (!node) return '';
-  const fragment = parse(node.innerHTML);
-  for (const toggle of fragment.querySelectorAll('[data-cmd="qz_toggle"], .load_img')) toggle.remove();
-  for (const br of fragment.querySelectorAll('br')) br.replaceWith(' ');
-  // Emoji text must remain text, even if an alt attribute contains HTML.
-  for (const img of fragment.querySelectorAll('img')) {
-    const alt = String(img.getAttribute('alt') || '')
-      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    img.replaceWith(alt);
-  }
-  return compact(fragment.textContent, 1200);
-}
-
-function feedImageUrl(value) {
-  if (typeof value !== 'string' || !value) return '';
-  try {
-    const url = new URL(value.startsWith('//') ? `https:${value}` : value);
-    if (!['http:', 'https:'].includes(url.protocol) || /(^|\.)qzonestyle\.gtimg\.cn$/i.test(url.hostname)) return '';
-    return url.href;
-  } catch { return ''; }
+function parsedFeedContent(root) {
+  // Qzone's current feed HTML moved the post body from `.f-info` to
+  // `.f-ct .txt-box-title`, which includes the author's nickname and colon.
+  const content = root.querySelector('.f-info')
+    || root.querySelector('.f-ct .txt-box-title')
+    || root.querySelector('.f-ct p');
+  if (!content) return '';
+  const fragment = parse(content.innerHTML);
+  for (const node of fragment.querySelectorAll('.nickname, .state')) node.remove();
+  return compact(fragment.textContent.replace(/^[\s:：]+/, ''), 1200);
 }
 
 export function parseQzoneFeed(feed) {
@@ -187,48 +223,33 @@ export function parseQzoneFeed(feed) {
       uin: String(item.getAttribute('data-uin') || ''),
       nickname: compact(item.getAttribute('data-nick') || '', 80),
       content: parsedCommentContent(item),
+      images: [...new Set(htmlImageUrls(item.innerHTML, true))].slice(0, 9),
       targetUin: '',
       targetName: '',
       time: 0
     };
   }).filter((comment) => comment.commentId && comment.uin);
-  // The first .f-info can be an empty hidden full-text placeholder. Exclude
-  // comments/reposts, prefer a populated full version, then the visible excerpt.
-  const body = root.querySelectorAll('.f-item').find((node) => node.getAttribute('data-key') === String(feed?.key || '')) || root;
-  const isOwnContent = (node) => {
-    for (let parent = node.parentNode; parent && parent !== body; parent = parent.parentNode) {
-      if (['mod-comments', 'comments-list', 'f-item-passive', 'f-ct-video'].some((name) => parent.classList?.contains(name))) return false;
-    }
-    return true;
-  };
-  const contentNodes = body.querySelectorAll('.f-info').filter(isOwnContent);
-  const full = contentNodes.find((node) => node.classList.contains('qz_info_complete') && feedContentText(node));
-  const excerpt = contentNodes.find((node) => !node.classList.contains('qz_info_complete'));
-  const metadata = body.querySelectorAll('[name="feed_data"]').find((node) => (
-    isOwnContent(node)
-    && node.getAttribute('data-uin') === String(feed?.uin || '')
-    && node.getAttribute('data-fkey') === String(feed?.key || '')
-  ));
-  const htmlImages = body.querySelectorAll('.img-item, .img-box img').filter(isOwnContent).flatMap((node) => {
-    if (node.hasAttribute('data-v_itemid') || node.hasAttribute('data-videotype')) return [];
-    const original = feedImageUrl(node.getAttribute('data-originurl') || node.getAttribute('data-url3'));
-    if (original) return [original];
-    const items = node.tagName === 'IMG' ? [node] : node.querySelectorAll('img');
-    return items.map((img) => img.getAttribute('truesrc') || img.getAttribute('src'));
-  });
-  const images = (Array.isArray(feed?.images) ? feed.images : htmlImages).map(feedImageUrl).filter(Boolean);
+  const images = root.querySelectorAll('.img-box img')
+    .filter((image) => {
+      for (let parent = image.parentNode; parent; parent = parent.parentNode) {
+        if (parent.classList?.contains('comments-item') || parent.classList?.contains('mod-comments')) return false;
+      }
+      return true;
+    })
+    .map((image) => imageUrl(image.getAttribute('data-src') || image.getAttribute('data-original') || image.getAttribute('src')))
+    .filter(Boolean);
   const like = root.querySelector('.qz_like_btn_v3');
   return {
-    tid: String(feed?.tid || metadata?.getAttribute('data-tid') || feed?.key || ''),
+    tid: String(feed?.key || ''),
     uin: String(feed?.uin || ''),
     nickname: compact(feed?.nickname || '', 80),
     time: Number(feed?.time) || 0,
     appid: Number(feed?.appid) || 0,
-    content: typeof feed?.content === 'string' ? compact(feed.content, 1200) : feedContentText(full || excerpt),
+    content: parsedFeedContent(root),
     images: [...new Set(images)].slice(0, 9),
     comments,
     isLiked: String(like?.getAttribute('data-islike') || '') === '1',
-    likeCount: Number(feed?.like_count ?? like?.getAttribute('data-likecnt')) || 0
+    likeCount: Number(like?.getAttribute('data-likecnt')) || 0
   };
 }
 
@@ -302,6 +323,7 @@ export class QzoneWebClient {
       uin: String(raw.uin || owner),
       nickname: compact(raw.name || '', 80),
       content: compact(raw.content || '', 1200),
+      images: qzoneImagesFromRaw(raw),
       time: Number(raw.created_time ?? raw.createTime ?? 0) || 0,
       comments: parseQzoneRawComments(raw.commentlist),
       commentCount: Number(raw.cmtnum) || 0

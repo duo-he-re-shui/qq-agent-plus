@@ -253,6 +253,12 @@
           <div class="gm-note-field">
             <input type="text" id="gm-newimp-qq" inputmode="numeric" placeholder="QQ 号" />
             <select id="gm-newimp-chat" aria-label="来源会话"></select>
+            <select id="gm-newimp-visibility" aria-label="新印象可见范围">
+              <option value="global">全局：所有群聊和私聊</option>
+              <option value="person">仅相关人物：此人的私聊 / 参与的群聊</option>
+              <option value="private">仅私聊：不进入群聊</option>
+              <option value="local">仅来源会话</option>
+            </select>
           </div>
           <div class="gm-note-field">
             <textarea id="gm-newimp-text" rows="3" placeholder="一行一条印象（如：爱钓鱼，周末常不在）"></textarea>
