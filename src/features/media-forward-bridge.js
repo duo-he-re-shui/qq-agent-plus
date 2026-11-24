@@ -25,9 +25,9 @@ export function createMediaForwarding({ dataDir, getConfig, sender, store, selfI
   return {
     bilibili, douyin,
     handleMessage(message) {
-      if (message.isSelf || !canRun(message.chatKey)) return;
-      bilibili.handleMessage(message);
-      douyin.handleMessage(message);
+      if (message.isSelf || !canRun(message.chatKey)) return null;
+      const tasks = [bilibili.handleMessage(message), douyin.handleMessage(message)].filter(Boolean);
+      return tasks.length ? Promise.all(tasks) : null;
     }
   };
 }

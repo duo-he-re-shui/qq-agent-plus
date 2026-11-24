@@ -32,6 +32,7 @@ import { GroupDigestManager } from '../features/group-digest.js';
 import { AdminBriefingManager } from '../features/admin-briefing.js';
 import { GroupGameManager } from '../features/group-game.js';
 import { ReminderStore } from '../core/reminders.js';
+import { MediaIngressGate } from '../core/media-ingress-gate.js';
 import { createMediaForwarding } from '../features/media-forward-bridge.js';
 import { PluginRegistry } from '../plugins/registry.js';
 import { McpManager } from '../mcp/manager.js';
@@ -615,6 +616,9 @@ export function createApp({
     },
     onReady: (chatKey) => emit('chat-update', chatKey),
     log: { info: (...args) => log(...args), warn: (...args) => log(...args) }
+  });
+  const mediaIngressGate = new MediaIngressGate({
+    onError: (chatKey, error) => log(`[media] ${chatKey} 等待视频处理失败: ${error?.message ?? error}`)
   });
   let identityPilot = null;
   let identityPilotError = '';
@@ -1309,7 +1313,8 @@ export function createApp({
     }
     emit('chat-update', chatKey);
     if (!isSelf && !arrivedInactive) {
-      mediaForwarding.handleMessage({ chatKey, text, segments, messageId: event.message_id, isSelf });
+      const mediaTask = mediaForwarding.handleMessage({ chatKey, text, segments, messageId: event.message_id, isSelf });
+      if (mediaTask) mediaIngressGate.hold(chatKey, mediaTask);
     }
     if (
       !isSelf
@@ -1323,7 +1328,7 @@ export function createApp({
     // 解析不了的消息返回 false，照常走下面的普通链路落到模型手里兜底。
     if (!isSelf && kind === 'private' && groupGame?.consumePrivateAction
       && await groupGame.consumePrivateAction(chatKey, stored)) return;
-    if (!isSelf) orchestrator.onIncoming(chatKey);
+    if (!isSelf) mediaIngressGate.wake(chatKey, () => orchestrator.onIncoming(chatKey));
   }
 
   // ── 启动/重连补齐 ──

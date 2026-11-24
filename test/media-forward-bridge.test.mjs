@@ -29,6 +29,23 @@ test('paused or disallowed chats and self messages never enter either downloader
   assert.deepEqual(calls, ['bili', 'douyin']);
 });
 
+test('media-link handling returns completion so the model wake can wait for frames', async () => {
+  const bridge = createMediaForwarding({ getConfig: () => ({}), canRun: () => true });
+  let release;
+  const pending = new Promise(resolve => { release = resolve; });
+  bridge.bilibili.handleMessage = () => pending;
+  bridge.douyin.handleMessage = () => null;
+  const completion = bridge.handleMessage({ chatKey: 'group:12345', text: 'video link' });
+  assert.ok(completion instanceof Promise);
+  let ready = false;
+  completion.then(() => { ready = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(ready, false);
+  release({ framesAttached: true });
+  await completion;
+  assert.equal(ready, true);
+});
+
 test('downloaded frames attach to the original link without modifying its text', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'media-bridge-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));

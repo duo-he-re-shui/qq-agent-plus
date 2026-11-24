@@ -102,6 +102,7 @@ export class DouyinAutoForward {
     this.seenTracker = createSeenTracker();
     this.seen = this.seenTracker.seen;
     this.seenCanonical = this.seenTracker.seenCanonical;
+    this.inflightByUrl = new Map();
     this.tempRoot = path.join(this.dataDir, 'douyin');
   }
 
@@ -125,10 +126,12 @@ export class DouyinAutoForward {
 
   handleMessage({ chatKey, text, segments = null, messageId = null, isSelf = false } = {}) {
     const cfg = normalizeConfig(this.getConfig());
-    if (!cfg.enabled || isSelf || !chatKey || (!cfg.allowPrivate && String(chatKey).startsWith('private:'))) return;
+    if (!cfg.enabled || isSelf || !chatKey || (!cfg.allowPrivate && String(chatKey).startsWith('private:'))) return null;
     const urls = [...new Set([...this.extractUrls(text), ...this.extractUrlsFromSegments(segments)])];
     if (urls.length) this.log.info?.(`[douyin] 检测到 ${urls.length} 个链接：${urls.join(', ')}`);
-    for (const url of urls) this.enqueue({ chatKey: String(chatKey), url, messageId, cfg });
+    return urls.length
+      ? Promise.all(urls.map((url) => this.enqueue({ chatKey: String(chatKey), url, messageId, cfg })))
+      : null;
   }
 
   enqueue(task) {
@@ -136,12 +139,16 @@ export class DouyinAutoForward {
     const seenKey = `${task.chatKey}|${dedupUrl}`;
     if (this.seenTracker.hasUrl(seenKey)) {
       this.log.info?.(`[douyin] 跳过六小时内重复链接：${task.url}`);
-      return;
+      return this.inflightByUrl.get(seenKey) || Promise.resolve({ duplicate: true });
     }
+    let complete;
+    const completion = new Promise((resolve) => { complete = resolve; });
     this.seenTracker.markUrl(seenKey);
-    this.pending.push({ ...task, dedupUrl, seenKey });
+    this.pending.push({ ...task, dedupUrl, seenKey, complete });
+    this.inflightByUrl.set(seenKey, completion);
     this.log.info?.(`[douyin] 已入队：${task.url}（队列 ${this.pending.length}）`);
     this.pump();
+    return completion;
   }
 
   pump() {
@@ -173,6 +180,8 @@ export class DouyinAutoForward {
           this.seenTracker.unmarkCanonical(task.canonicalKey);
         }
         this.running -= 1;
+        this.inflightByUrl.delete(task.seenKey);
+        task.complete?.({ sent: task.mediaSent === true, error: task.error || '' });
         this.pump();
       });
     }
