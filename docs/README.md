@@ -21,6 +21,7 @@
 
 | 文档 | 说明 |
 | --- | --- |
+| [BILIBILI-AUTO-FORWARD.md](BILIBILI-AUTO-FORWARD.md) | 抖音/B站分享链接自动转发、容器共享目录与原链接视频画面读取 |
 | [CONVERSATION_MODES.md](CONVERSATION_MODES.md) | 对话引擎三模式（legacy / threaded / lifecycle）的差异与选择 |
 | [DAILY_MOMENTS.md](DAILY_MOMENTS.md) | 每日说说：生成、发布、去重与计划/时间口径 |
 | [QZONE_INTERACTIONS.md](QZONE_INTERACTIONS.md) | 好友动态与评论回复的巡检节奏与退避 |

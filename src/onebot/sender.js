@@ -454,6 +454,100 @@ export class SendQueue {
     });
   }
 
+  image(chatKey, { url, bytes = 0, label = '', text: caption = '' } = {}, options = {}) {
+    const [kind, id] = String(chatKey).split(':');
+    const chain = this.#chain(chatKey);
+    return chain(async () => {
+      // 与 sendTextBatch/sendSticker 同一道防线：上一次发送结果 unknown（超时/5xx）时
+      // 停止后续发送，避免"不知道发没发出去"的消息与图片叠加出多笔 unknown 记账。
+      if (options.runId && this.store.hasUncertainEffects(options.runId)) throw new Error('Previous send delivery is uncertain');
+      this.#checkRate(chatKey);
+      await sleep(randInt(600, 1500)); // 发图前真人式的短暂停顿
+      const detail = String(caption || '').trim().slice(0, 6000);
+      const data = await this.#deliver(chatKey, options, { type: 'image', bytes: Number(bytes) || 0, ...(detail ? { text: detail } : {}) }, () => this.onebot.sendImage(kind, id, url, {
+        replyToMessageId: options.replyToMessageId ?? null,
+        atUserId: options.atUserId ?? null,
+        text: detail,
+        signal: options.signal
+      }));
+      const ts = Date.now();
+      let targetUserId = this.#replyTarget(chatKey, options);
+      if (!targetUserId && kind === 'private') targetUserId = String(id);
+      const text = `[图片${label ? `:${String(label).slice(0, 40)}` : ''}]${detail ? `\n${detail}` : ''}`;
+      this.#afterSent(() => {
+        this.store.appendSelf(chatKey, {
+        text,
+        ts,
+        mid: data?.message_id ?? null,
+        targetUserId,
+        eventKind: 'message'
+        });
+      this.onSent?.({ chatKey, text, messageId: data?.message_id ?? null, imageBytes: Number(bytes) || 0 });
+      });      return { message_id: data?.message_id ?? null };
+    });
+  }
+
+
+  forward(chatKey, { nodes, label = '' } = {}, options = {}) {
+    const [kind, id] = String(chatKey).split(':');
+    const list = Array.isArray(nodes) ? nodes.filter(Boolean) : [];
+    const chain = this.#chain(chatKey);
+    return chain(async () => {
+      if (options.runId && this.store.hasUncertainEffects(options.runId)) throw new Error('Previous send delivery is uncertain');
+      if (!list.length) throw new Error('合并转发至少要有一条内容');
+      this.#checkRate(chatKey);
+      await sleep(randInt(600, 1500)); // 与发图同一条真人式停顿
+      const data = await this.#deliver(
+        chatKey,
+        options,
+        { type: 'forward', count: list.length },
+        () => this.onebot.sendForwardMsg(kind, id, list, { signal: options.signal })
+      );
+      const ts = Date.now();
+      let targetUserId = this.#replyTarget(chatKey, options);
+      if (!targetUserId && kind === 'private') targetUserId = String(id);
+      const text = `[聊天记录${label ? `:${String(label).slice(0, 40)}` : ''}（${list.length} 条）]`;
+      this.#afterSent(() => {
+        this.store.appendSelf(chatKey, {
+          text,
+          ts,
+          mid: data?.message_id ?? null,
+          targetUserId,
+          eventKind: 'message'
+        });
+        this.onSent?.({ chatKey, text, messageId: data?.message_id ?? null, forwardCount: list.length });
+      });
+      return { message_id: data?.message_id ?? null };
+    });
+  }
+
+
+  video(chatKey, { file, duration = 0, label = '' } = {}, options = {}) {
+    const [kind, id] = String(chatKey).split(':');
+    const chain = this.#chain(chatKey);
+    return chain(async () => {
+      if (options.runId && this.store.hasUncertainEffects(options.runId)) throw new Error('Previous send delivery is uncertain');
+      this.#checkRate(chatKey);
+      const data = await this.#deliver(chatKey, options, { type: 'video', duration }, () =>
+        this.onebot.sendVideo(kind, id, file, {
+          text: options.text ?? null,
+          replyToMessageId: options.replyToMessageId ?? null,
+          atUserId: options.atUserId ?? null,
+          signal: options.signal
+        }));
+      const ts = Date.now();
+      let targetUserId = this.#replyTarget(chatKey, options);
+      if (!targetUserId && kind === 'private') targetUserId = String(id);
+      const text = `[视频${label ? `:${String(label).slice(0, 80)}` : ''}]`;
+      this.#afterSent(() => {
+        this.store.appendSelf(chatKey, { text, ts, mid: data?.message_id ?? null, targetUserId, eventKind: 'message' });
+        this.onSent?.({ chatKey, text, messageId: data?.message_id ?? null, video: true, duration });
+      });
+      return { message_id: data?.message_id ?? null };
+    });
+  }
+
+
   /** 发送一个收藏表情（独立气泡）。 */
   sendSticker(chatKey, sticker, options = {}) {
     const [kind, id] = String(chatKey).split(':');

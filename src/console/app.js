@@ -32,6 +32,7 @@ import { GroupDigestManager } from '../features/group-digest.js';
 import { AdminBriefingManager } from '../features/admin-briefing.js';
 import { GroupGameManager } from '../features/group-game.js';
 import { ReminderStore } from '../core/reminders.js';
+import { createMediaForwarding } from '../features/media-forward-bridge.js';
 import { PluginRegistry } from '../plugins/registry.js';
 import { McpManager } from '../mcp/manager.js';
 import { searchRegistry } from '../mcp/registry.js';
@@ -605,6 +606,15 @@ export function createApp({
     onebot, store,
     onSent: ({ chatKey, text }) => log(`[发送 -> ${chatKey}] ${String(text).slice(0, 60)}`),
     onIncident: (error, context) => incidentPilot?.capture(error, context)
+  });
+  const mediaForwarding = createMediaForwarding({
+    dataDir: DATA_DIR, getConfig, sender, store,
+    selfId: () => onebot.selfId,
+    canRun: (chatKey) => {
+      try { assertCanSend(chatKey); return true; } catch { return false; }
+    },
+    onReady: (chatKey) => emit('chat-update', chatKey),
+    log: { info: (...args) => log(...args), warn: (...args) => log(...args) }
   });
   let identityPilot = null;
   let identityPilotError = '';
@@ -1298,6 +1308,9 @@ export function createApp({
         log('[sticker] 自动收藏失败:', error?.message ?? error));
     }
     emit('chat-update', chatKey);
+    if (!isSelf && !arrivedInactive) {
+      mediaForwarding.handleMessage({ chatKey, text, segments, messageId: event.message_id, isSelf });
+    }
     if (
       !isSelf
       && (

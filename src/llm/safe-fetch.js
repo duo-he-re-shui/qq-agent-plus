@@ -390,6 +390,11 @@ export async function safeFetchBinary(urlString, maxBytes = 12 * 1024 * 1024, si
   throw new Error('重定向次数过多，已停止');
 }
 
+/** Public media fetches must never inherit the private-image exception. */
+export async function safeFetchPublicBinary(urlString, maxBytes, signal, headers = {}) {
+  return safeFetchBinary(urlString, maxBytes, signal, { allowPrivate: false, headers });
+}
+
 /**
  * 图片地址校验（供 send_sticker / 图片下载使用）。
  * 默认内网地址一律拒绝；security.allowPrivateImageHosts=true 时放行（仅本地测试/自建图床）。

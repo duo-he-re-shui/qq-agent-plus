@@ -678,6 +678,11 @@ export const DEFAULT_CONFIG = {
     // 按备注名发送表情（send_sticker）不受影响。
     stickers: true
   },
+  // 从分享链接下载媒体；独立启停，仍受白名单、活跃时间与暂停开关约束。
+  bilibili: { enabled: false, allowPrivate: false, qn: 16, maxFileBytes: 60 * 1024 * 1024,
+    maxDurationSeconds: 900, maxConcurrent: 1, rejectCollections: false },
+  douyin: { enabled: false, allowPrivate: false, preferredQuality: '720p', maxFileBytes: 60 * 1024 * 1024,
+    maxDurationSeconds: 900, maxConcurrent: 1, forwardGallery: true },
   // 插件（第三方扩展，默认全关；契约与信任声明见 docs/PLUGINS.md）
   plugins: {
     // 总开关。关着 = 一个插件都不加载（装了但不开也是这样，落地没有任何副作用）。
